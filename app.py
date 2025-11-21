@@ -67,9 +67,9 @@ class AmazonSearcher:
         self.mp_id = 'A1VC38T7YXB528'
 
     def get_product_details(self, asin):
-        """ASINから詳細情報を取得（最安値フォールバック機能付き）"""
+        """ASINから詳細情報を取得（強力な価格取得ロジック搭載）"""
         try:
-            # Catalog API
+            # 1. Catalog API (基本情報)
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
             res = catalog.get_catalog_item(
                 asin=asin,
@@ -110,19 +110,20 @@ class AmazonSearcher:
                         s_fee = calculate_shipping_fee(h, l, w)
                         info['shipping'] = f"¥{s_fee}" if s_fee != 'N/A' else '-'
 
-                # ランキング（大分類を取得するように修正済み）
+                # ランキング
                 if 'salesRanks' in data and data['salesRanks']:
                     ranks = data['salesRanks'][0].get('ranks', [])
                     if ranks:
-                        r = ranks[0]  # ranks[0] = 大分類, ranks[-1] = 小分類
+                        r = ranks[0]  # 大分類
                         info['category'] = r.get('title', '')
                         info['rank'] = r.get('rank', 999999)
                         info['rank_disp'] = f"{info['rank']}位"
 
-            # 価格・カート情報 (Products API)
-            # カート獲得者がいない場合は最安値を採用するロジック
+            # 2. 価格情報 (Products API)
+            products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
+            
+            # --- Plan A: get_item_offers (詳細なオファー情報を取得) ---
             try:
-                products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
                 offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, item_condition='New')
                 
                 if offers and offers.payload and 'Offers' in offers.payload:
@@ -130,7 +131,6 @@ class AmazonSearcher:
                     lowest_price = float('inf')
                     best_offer = None
 
-                    # 全オファーをチェック
                     for offer in offers.payload['Offers']:
                         listing_price = offer.get('ListingPrice', {}).get('Amount', 0)
                         shipping = offer.get('Shipping', {}).get('Amount', 0)
@@ -138,34 +138,63 @@ class AmazonSearcher:
                         
                         if total_price == 0: continue
 
-                        # 1. カート獲得者を優先
+                        # カート獲得者を優先
                         if offer.get('IsBuyBoxWinner', False):
                             best_offer = offer
                             info['price'] = total_price
                             found_buybox = True
-                            break # カート獲得者が見つかれば即決定
+                            break 
                         
-                        # 2. 最安値を記録（カート未発見時の保険）
+                        # 最安値を記録
                         if total_price < lowest_price:
                             lowest_price = total_price
                             if not found_buybox:
                                 best_offer = offer
                                 info['price'] = total_price
 
-                    # 最終的な価格情報をセット
                     if best_offer:
                         p = info['price']
                         info['price_disp'] = f"¥{p:,.0f}"
                         info['seller'] = best_offer.get('SellerId', '')
-                        
                         points = best_offer.get('Points', {}).get('PointsNumber', 0)
                         if points > 0 and p > 0:
                             info['points'] = f"{(points/p)*100:.1f}%"
-
             except Exception:
-                pass # 価格取得エラーは無視
+                pass
 
-            # 手数料 (Fees API)
+            # --- Plan B: get_pricing (Plan Aで取れなかった場合のバックアップ) ---
+            if info['price'] == 0:
+                try:
+                    price_res = products_api.get_pricing(MarketplaceId=self.mp_id, Asins=[asin], ItemType='Asin')
+                    if price_res and price_res.payload:
+                        product_data = price_res.payload[0].get('Product', {})
+                        
+                        # 優先順位1: Competitive Price (カート価格相当)
+                        comp_prices = product_data.get('CompetitivePricing', {}).get('CompetitivePrices', [])
+                        if comp_prices:
+                            # LandedPrice(送料込)があればそれを、なければListingPriceを使う
+                            price_obj = comp_prices[0].get('Price', {})
+                            amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
+                            
+                            if amount > 0:
+                                info['price'] = amount
+                                info['price_disp'] = f"¥{amount:,.0f}"
+                                info['seller'] = 'Amazon/Others' # 取得元が特定できないため
+                        
+                        # 優先順位2: Lowest Offer (最安値情報)
+                        if info['price'] == 0:
+                            lowest = product_data.get('LowestOfferListings', [])
+                            if lowest:
+                                price_obj = lowest[0].get('Price', {})
+                                amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
+                                
+                                if amount > 0:
+                                    info['price'] = amount
+                                    info['price_disp'] = f"¥{amount:,.0f}"
+                except Exception:
+                    pass
+
+            # 3. 手数料 (Fees API)
             if info['price'] > 0:
                 try:
                     fees_api = ProductFees(credentials=self.credentials, marketplace=self.marketplace)
@@ -195,10 +224,9 @@ class AmazonSearcher:
         
         found_items = []
         page_token = None
-        
         status_text = st.empty()
         
-        # 適合度順で返るため、ランキング順にするために1.5倍程度スキャンしてからソートする
+        # 1.5倍スキャン
         scan_limit = int(max_results * 1.5)
         if scan_limit < 20: scan_limit = 20
 
@@ -220,18 +248,14 @@ class AmazonSearcher:
                     
                     for item in items:
                         asin = item.get('asin')
-                        rank_val = 9999999 # ランキングがない場合のデフォルト値
-                        
+                        rank_val = 9999999 
                         if 'salesRanks' in item and item['salesRanks']:
                             ranks_list = item['salesRanks'][0].get('ranks', [])
                             if ranks_list:
-                                # ranks[0]が大分類
                                 rank_val = ranks_list[0].get('rank', 9999999)
-                        
                         found_items.append({'asin': asin, 'rank': rank_val})
                     
                     status_text.text(f"候補を検索中... {len(found_items)}件 取得")
-                    
                     page_token = res.next_token
                     if not page_token: break
                 else:
@@ -241,12 +265,9 @@ class AmazonSearcher:
                 st.error(f"検索エラー: {e}")
                 break
         
-        # ランキング順（昇順）に並び替え
+        # ソートと抽出
         sorted_items = sorted(found_items, key=lambda x: x['rank'])
-        
-        # 上位から指定件数分だけASINリストにして返す
         final_asins = [item['asin'] for item in sorted_items][:max_results]
-        
         return final_asins
 
     def search_by_jan(self, jan_code):
@@ -267,16 +288,14 @@ def main():
     if not check_password():
         return
 
-    st.title("📦 Amazon SP-API 商品リサーチツール（made by 岡田屋）")
+    st.title("📦 Amazon SP-API 商品リサーチツール")
 
-    # サイドバー：API設定（Secrets対応版）
+    # サイドバー
     with st.sidebar:
         st.header("⚙️ 設定")
-        
         if "LWA_APP_ID" in st.secrets:
             st.success("✅ 認証情報は設定済みです")
             st.info("キーは安全に保護されています。")
-            
             lwa_app_id = st.secrets["LWA_APP_ID"]
             lwa_client_secret = st.secrets["LWA_CLIENT_SECRET"]
             refresh_token = st.secrets["REFRESH_TOKEN"]
@@ -290,37 +309,31 @@ def main():
             aws_access_key = st.text_input("AWS Access Key", type="password")
             aws_secret_key = st.text_input("AWS Secret Key", type="password")
 
-    # 検索条件の設定
+    # 検索条件
     st.markdown("### 🔍 検索条件")
     col_mode, col_limit = st.columns([2, 1])
-    
     with col_mode:
         search_mode = st.selectbox(
             "検索モードを選択",
             ["JANコードリスト", "ASINリスト", "ブランド検索", "カテゴリ/キーワード検索"]
         )
-
     with col_limit:
         max_results = st.slider("取得件数上限", 10, 200, 50, 10)
 
-    # 入力エリア
     input_data = ""
     if search_mode in ["JANコードリスト", "ASINリスト"]:
         input_data = st.text_area(f"{search_mode}を入力 (1行に1つ)", height=150)
     else:
         input_data = st.text_input(f"{search_mode} キーワードを入力")
 
-    # 実行ボタン
     if st.button("検索開始", type="primary"):
         if not (lwa_app_id and lwa_client_secret and refresh_token):
-            st.error("左側のサイドバーでAPI認証情報を設定してください。")
+            st.error("API認証情報を設定してください。")
             return
-        
         if not input_data:
-            st.warning("検索キーワードまたはリストを入力してください。")
+            st.warning("検索条件を入力してください。")
             return
 
-        # クレデンシャル
         credentials = {
             'refresh_token': refresh_token,
             'lwa_app_id': lwa_app_id,
@@ -332,29 +345,23 @@ def main():
 
         searcher = AmazonSearcher(credentials)
         target_asins = []
-
         progress_bar = st.progress(0)
         status_text = st.empty()
-        result_container = st.container()
 
-        # 1. ASINリストの生成
+        # 1. ASINリスト生成
         status_text.info("ASINリストを作成中...")
-        
         if search_mode == "JANコードリスト":
             jan_list = [line.strip() for line in input_data.split('\n') if line.strip()]
             for i, jan in enumerate(jan_list):
                 status_text.text(f"JAN変換中: {jan} ({i+1}/{len(jan_list)})")
                 asin = searcher.search_by_jan(jan)
-                if asin:
-                    target_asins.append(asin)
+                if asin: target_asins.append(asin)
                 time.sleep(0.5)
                 progress_bar.progress((i + 1) / len(jan_list) * 0.3)
-
         elif search_mode == "ASINリスト":
             target_asins = [line.strip() for line in input_data.split('\n') if line.strip()]
             progress_bar.progress(30)
-
-        else: # ブランド または カテゴリ/キーワード
+        else:
             target_asins = searcher.search_by_keywords(input_data, max_results)
             progress_bar.progress(30)
 
@@ -362,15 +369,14 @@ def main():
             st.error("対象の商品が見つかりませんでした。")
             return
 
-        st.success(f"{len(target_asins)} 件の商品ASINを特定しました。詳細情報を取得します...")
+        st.success(f"{len(target_asins)} 件の商品ASINを特定。詳細情報を取得します...")
         
-        # 2. 詳細情報の取得
+        # 2. 詳細情報取得
         results = []
         df_placeholder = st.empty()
         
         for i, asin in enumerate(target_asins):
-            status_text.text(f"詳細データ取得中: {asin} ({i+1}/{len(target_asins)})")
-            
+            status_text.text(f"データ取得中: {asin} ({i+1}/{len(target_asins)})")
             time.sleep(1.5) 
             
             detail = searcher.get_product_details(asin)
@@ -379,13 +385,11 @@ def main():
             
             if results:
                 df_current = pd.DataFrame(results)
-                # 表示用カラム
                 display_cols = {
                     'title': '商品名', 'brand': 'ブランド', 'price_disp': '価格', 
                     'rank_disp': 'ランキング', 'category': 'カテゴリ',
                     'points': 'ポイント率', 'fee_rate': '手数料率', 'asin': 'ASIN'
                 }
-                # 表示用に不要な列を除外してリネーム
                 cols_to_show = [c for c in display_cols.keys() if c in df_current.columns]
                 df_show = df_current[cols_to_show].rename(columns=display_cols)
                 df_placeholder.dataframe(df_show, use_container_width=True)
@@ -393,20 +397,16 @@ def main():
             current_progress = 0.3 + ((i + 1) / len(target_asins) * 0.7)
             progress_bar.progress(min(current_progress, 1.0))
 
-        status_text.success("データ取得完了！")
+        status_text.success("完了！")
         progress_bar.progress(100)
 
-        # 3. ダウンロード機能
+        # 3. ダウンロード
         if results:
             df_final = pd.DataFrame(results)
-            
-            # 不要な列（生の数値データ）をCSVから削除
             df_final = df_final.drop(columns=['rank', 'price'], errors='ignore')
-
-            # 日本時間の日付ファイル名
+            
             jst = pytz.timezone('Asia/Tokyo')
             filename = f"amazon_research_{datetime.now(jst).strftime('%Y%m%d_%H%M%S')}.csv"
-            
             csv = df_final.to_csv(index=False).encode('utf-8_sig')
             
             st.download_button(
