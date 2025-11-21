@@ -225,23 +225,29 @@ def main():
 
     st.title("📦 Amazon SP-API 商品リサーチツール")
 
-    # サイドバー：API設定
+# サイドバー：API設定
     with st.sidebar:
         st.header("⚙️ 設定")
-        st.info("SP-APIの認証情報を入力してください。")
         
-        # セッション状態またはSecretsから初期値を取得
-        default_lwa_app_id = st.secrets.get("LWA_APP_ID", "") if "LWA_APP_ID" in st.secrets else ""
-        default_lwa_secret = st.secrets.get("LWA_CLIENT_SECRET", "") if "LWA_CLIENT_SECRET" in st.secrets else ""
-        default_refresh = st.secrets.get("REFRESH_TOKEN", "") if "REFRESH_TOKEN" in st.secrets else ""
-        default_aws_key = st.secrets.get("AWS_ACCESS_KEY", "") if "AWS_ACCESS_KEY" in st.secrets else ""
-        default_aws_secret = st.secrets.get("AWS_SECRET_KEY", "") if "AWS_SECRET_KEY" in st.secrets else ""
-        
-        lwa_app_id = st.text_input("LWA App ID", value=default_lwa_app_id, type="password")
-        lwa_client_secret = st.text_input("LWA Client Secret", value=default_lwa_secret, type="password")
-        refresh_token = st.text_input("Refresh Token", value=default_refresh, type="password")
-        aws_access_key = st.text_input("AWS Access Key", value=default_aws_key, type="password")
-        aws_secret_key = st.text_input("AWS Secret Key", value=default_aws_secret, type="password")
+        # Secretsに設定があるか確認
+        if "LWA_APP_ID" in st.secrets:
+            st.success("✅ 認証情報はクラウド設定から読み込まれました")
+            st.info("キーは安全に保護されています。")
+            
+            # 変数に直接代入（画面には表示しない）
+            lwa_app_id = st.secrets["LWA_APP_ID"]
+            lwa_client_secret = st.secrets["LWA_CLIENT_SECRET"]
+            refresh_token = st.secrets["REFRESH_TOKEN"]
+            aws_access_key = st.secrets["AWS_ACCESS_KEY"]
+            aws_secret_key = st.secrets["AWS_SECRET_KEY"]
+        else:
+            # Secretsがない場合のみ入力欄を表示（テスト用など）
+            st.warning("Secretsが設定されていません。手動入力してください。")
+            lwa_app_id = st.text_input("LWA App ID", type="password")
+            lwa_client_secret = st.text_input("LWA Client Secret", type="password")
+            refresh_token = st.text_input("Refresh Token", type="password")
+            aws_access_key = st.text_input("AWS Access Key", type="password")
+            aws_secret_key = st.text_input("AWS Secret Key", type="password")
 
     # 検索条件の設定
     st.markdown("### 🔍 検索条件")
