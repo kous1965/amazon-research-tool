@@ -72,7 +72,7 @@ class AmazonSearcher:
         self.logs.append(f"[{ts}] {message}")
 
     def get_prices_batch(self, asin_list):
-        """【修正済】ASINリストを一括で価格取得する"""
+        """ASINリストを一括で価格取得（ポイント考慮版）"""
         products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
         price_map = {} 
 
@@ -82,7 +82,6 @@ class AmazonSearcher:
             self.log(f"Batch Requesting prices for {len(chunk)} items...")
             
             try:
-                # ★修正: 第一引数(asin_list)として chunk をそのまま渡す
                 res = products_api.get_competitive_pricing_for_asins(chunk, MarketplaceId=self.mp_id)
                 
                 if res and res.payload:
@@ -92,8 +91,9 @@ class AmazonSearcher:
                         
                         best_price = float('inf')
                         best_seller = 'Unknown'
+                        best_points = 0
                         
-                        # Competitive Pricing (カート価格)
+                        # 1. Competitive Pricing (カート価格)
                         comp = product.get('CompetitivePricing', {}).get('CompetitivePrices', [])
                         for cp in comp:
                             price_dict = cp.get('Price', {})
@@ -102,14 +102,23 @@ class AmazonSearcher:
                             amount = landed or listing
                             
                             if amount and amount > 0:
-                                if amount < best_price:
-                                    best_price = amount
+                                # ★ここが修正点: ポイントがあれば価格に足し戻す
+                                # APIのCompetitivePriceは「ポイント差し引き後の実質価格」を返すことがあるため
+                                points_info = cp.get('Points', {})
+                                p_val = (points_info.get('PointsMonetaryValue') or {}).get('Amount')
+                                if p_val is None:
+                                    p_val = points_info.get('PointsNumber', 0)
+                                
+                                real_price = float(amount) + float(p_val)
+                                
+                                if real_price < best_price:
+                                    best_price = real_price
                                     best_seller = 'Cart Price'
+                                    best_points = float(p_val)
 
-                        # Lowest Offer (最安値)
+                        # 2. Lowest Offer (最安値)
                         lowest = product.get('LowestOfferListings', [])
                         for lo in lowest:
-                            # 新品(New)のみ
                             if (lo.get('Qualifiers') or {}).get('ItemCondition') == 'New':
                                 price_dict = lo.get('Price', {})
                                 landed = (price_dict.get('LandedPrice') or {}).get('Amount')
@@ -117,20 +126,25 @@ class AmazonSearcher:
                                 amount = landed or listing
                                 
                                 if amount and amount > 0:
-                                    if amount < best_price:
-                                        best_price = amount
+                                    # LowestOfferは通常、そのままの価格で返ってくることが多いが念のため
+                                    points_info = lo.get('Points', {})
+                                    p_val = (points_info.get('PointsMonetaryValue') or {}).get('Amount')
+                                    if p_val is None:
+                                        p_val = points_info.get('PointsNumber', 0)
+                                        
+                                    # 最安値APIの場合は、もしポイント考慮済みなら足すべきだが、
+                                    # 通常はListingPriceそのものが返るため、ここでは単純比較する
+                                    if float(amount) < best_price:
+                                        best_price = float(amount)
                                         best_seller = 'Lowest Offer'
+                                        best_points = float(p_val)
 
                         if best_price != float('inf'):
                             price_map[asin] = {
                                 'price': best_price,
-                                'seller': best_seller
+                                'seller': best_seller,
+                                'points': best_points
                             }
-                            self.log(f"Found batch price for {asin}: {best_price}")
-                        else:
-                            self.log(f"No batch price for {asin}")
-                else:
-                    self.log(f"Batch payload empty")
                 
                 time.sleep(1.0)
             except Exception as e:
@@ -140,7 +154,7 @@ class AmazonSearcher:
         return price_map
 
     def get_product_details(self, asin, pre_fetched_price_data=None):
-        """詳細情報を取得（バッチデータ優先、なければ個別取得）"""
+        """詳細情報を取得"""
         try:
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
             
@@ -205,14 +219,17 @@ class AmazonSearcher:
                 info['price'] = pre_fetched_price_data['price']
                 info['price_disp'] = f"¥{info['price']:,.0f}"
                 info['seller'] = pre_fetched_price_data['seller']
+                
+                # ポイント率計算（足し戻した価格を基準にする）
+                pt = pre_fetched_price_data.get('points', 0)
+                if pt > 0:
+                    info['points'] = f"{(pt/info['price'])*100:.1f}%"
             
             else:
-                # バッチで取れなかった場合の個別取得 (最後の手段)
+                # バッチ失敗時の個別取得
                 products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
                 try:
-                    # ★修正: item_condition (小文字) で指定
                     offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, item_condition='New')
-                    
                     if offers and offers.payload and 'Offers' in offers.payload:
                         best_p = float('inf')
                         best_s = ''
@@ -232,7 +249,6 @@ class AmazonSearcher:
                             info['seller'] = best_s
                             if best_pt > 0: info['points'] = f"{(best_pt/best_p)*100:.1f}%"
                 except Exception as e:
-                    # self.log(f"Single fetch error {asin}: {e}") 
                     pass
 
             # 3. 参考価格フォールバック
@@ -268,7 +284,6 @@ class AmazonSearcher:
         catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
         found_items = []
         page_token = None
-        status_text = st.empty()
         
         scan_limit = int(max_results * 1.5)
         if scan_limit < 20: scan_limit = 20
@@ -298,7 +313,6 @@ class AmazonSearcher:
                             ranks_list = item['salesRanks'][0].get('ranks', [])
                             if ranks_list: rank_val = ranks_list[0].get('rank', 9999999)
                         found_items.append({'asin': asin, 'rank': rank_val})
-                    status_text.text(f"候補を検索中... {len(found_items)}件 取得")
                     page_token = res.next_token
                     if not page_token: break
                 else: break
