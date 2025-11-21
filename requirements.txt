@@ -1,0 +1,6 @@
+streamlit
+pandas
+python-amazon-sp-api
+gspread
+oauth2client
+pytz
