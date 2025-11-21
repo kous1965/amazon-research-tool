@@ -281,7 +281,7 @@ class AmazonSearcher:
 def main():
     if not check_password(): return
 
-    st.title("📦 Amazon SP-API 商品リサーチツール")
+    st.title("📦 Amazon SP-API 商品リサーチツール（made by 岡田屋）")
 
     with st.sidebar:
         st.header("⚙️ 設定")
