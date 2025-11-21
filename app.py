@@ -67,7 +67,7 @@ class AmazonSearcher:
         self.mp_id = 'A1VC38T7YXB528'
 
     def get_product_details(self, asin):
-        """ASINから詳細情報を取得（プランF: 全コンディション総当たり強力取得版）"""
+        """ASINから詳細情報を取得（プランG: 最安値・絶対採用ロジック）"""
         try:
             # 1. Catalog API (基本情報)
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
@@ -93,7 +93,7 @@ class AmazonSearcher:
                     info['title'] = data['summaries'][0].get('itemName', '')
                     info['brand'] = data['summaries'][0].get('brandName', '')
 
-                # JANコード & 参考価格(ListPrice)
+                # JANコード & 参考価格
                 if 'attributes' in data:
                     attrs = data['attributes']
                     if 'externally_assigned_product_identifier' in attrs:
@@ -130,9 +130,11 @@ class AmazonSearcher:
                         info['rank'] = r.get('rank', 999999)
                         info['rank_disp'] = f"{info['rank']}位"
 
-            # 2. 価格取得フェーズ (全方位取得)
+            # 2. 価格取得フェーズ (シンプル・最安値収集)
             products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
-            candidate_prices = [] # 収集した価格リスト
+            
+            # 取得できたすべての有効な価格をここに入れる
+            collected_prices = [] 
 
             # --- Source A: get_pricing (カート価格・最安値API) ---
             try:
@@ -140,106 +142,66 @@ class AmazonSearcher:
                 if price_res and price_res.payload:
                     product_data = price_res.payload[0].get('Product', {})
                     
-                    # A-1: Competitive Price (カート獲得価格)
-                    # 優先度: 1 (非常に高い)
+                    # Competitive Price (カート価格)
                     comp_prices = product_data.get('CompetitivePricing', {}).get('CompetitivePrices', [])
                     for cp in comp_prices:
                         price_obj = cp.get('Price', {})
                         amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
                         if amount > 0:
-                            candidate_prices.append({
-                                'price': amount,
-                                'seller': 'Amazon/Winner',
-                                'points': 0, 
-                                'priority': 1
-                            })
+                            collected_prices.append(amount)
 
-                    # A-2: Lowest Offer (最安値情報)
-                    # 優先度: 2 (高い)
+                    # Lowest Offer (最安値情報)
                     lowest_offers = product_data.get('LowestOfferListings', [])
                     for lo in lowest_offers:
-                        # 新品のみ対象
-                        if lo.get('Qualifiers', {}).get('ItemCondition') == 'New':
-                            price_obj = lo.get('Price', {})
-                            amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
-                            if amount > 0:
-                                candidate_prices.append({
-                                    'price': amount,
-                                    'seller': 'Lowest Offer',
-                                    'points': 0,
-                                    'priority': 2
-                                })
+                        price_obj = lo.get('Price', {})
+                        amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
+                        if amount > 0:
+                            collected_prices.append(amount)
             except Exception:
                 pass
 
-            # --- Source B: get_item_offers (全コンディション取得・最強版) ---
-            # item_conditionを指定しないことで、Amazonが隠している「セール特価」や「特殊な新品」も全て拾います。
+            # --- Source B: get_item_offers (全オファー取得) ---
+            # ここで「カート獲得フラグ」などの条件を一切無視して、価格だけ抜き取る
             try:
-                # フィルタなしで全オファー取得
                 offers_all = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id)
-                
                 if offers_all and offers_all.payload and 'Offers' in offers_all.payload:
                     for offer in offers_all.payload['Offers']:
                         listing_price = offer.get('ListingPrice', {}).get('Amount', 0)
                         shipping = offer.get('Shipping', {}).get('Amount', 0)
                         total_price = listing_price + shipping
                         
-                        if total_price == 0: continue
-                        
-                        seller = offer.get('SellerId', '')
-                        points = offer.get('Points', {}).get('PointsNumber', 0)
-                        is_buybox = offer.get('IsBuyBoxWinner', False)
-                        cond = offer.get('SubCondition', 'Unknown') # new, mint, verygood...
+                        if total_price > 0:
+                            # ポイント情報の保持（あとで最安値と一致したら使う）
+                            points = offer.get('Points', {}).get('PointsNumber', 0)
+                            collected_prices.append(total_price)
+                            
+                            # ポイント計算用の仮保存（価格をキーにする）
+                            if not hasattr(self, 'price_point_map'): self.price_point_map = {}
+                            self.price_point_map[f"{asin}_{total_price}"] = points
 
-                        # 優先度の決定ロジック
-                        # 0: カート獲得者 (最強・セール品はここになりやすい)
-                        # 3: その他の新品 (New)
-                        # 5: 中古 (Mint, VeryGoodなど) - 最後の手段
-                        
-                        prio = 99 # デフォルト（対象外）
-
-                        if is_buybox:
-                            prio = 0 # カート獲得者は状態問わず最優先（セール品がここに来るため）
-                        elif cond == 'New':
-                            prio = 3 # 新品
-                        elif cond in ['Mint', 'VeryGood', 'Good', 'Acceptable']:
-                            prio = 5 # 中古
-                        
-                        if prio < 99:
-                            candidate_prices.append({
-                                'price': total_price, 
-                                'seller': f"{seller}", 
-                                'points': points, 
-                                'priority': prio
-                            })
             except Exception:
                 pass
 
-            # --- 最終価格決定ロジック ---
-            if candidate_prices:
-                # 1. 優先度が高い順 (0->1->2->3->5)
-                # 2. 価格が安い順
-                # でソートする
-                candidate_prices.sort(key=lambda x: (x['priority'], x['price']))
+            # --- 最終価格決定ロジック (The "Vacuum" Strategy) ---
+            # 集めた価格の中で「一番安いもの」を正義とする
+            if collected_prices:
+                min_price = min(collected_prices)
                 
-                # 最良のものを採用
-                best = candidate_prices[0]
+                info['price'] = min_price
+                info['price_disp'] = f"¥{min_price:,.0f}"
+                info['seller'] = 'Best Price' # 誰かは問わない
                 
-                info['price'] = best['price']
-                info['price_disp'] = f"¥{best['price']:,.0f}"
-                info['seller'] = best['seller']
-                
-                # ポイント率
-                p_val = best['points']
-                if p_val > 0:
-                    info['points'] = f"{(p_val/best['price'])*100:.1f}%"
+                # ポイントの復元（採用した価格に紐づくポイントがあれば表示）
+                map_key = f"{asin}_{min_price}"
+                if hasattr(self, 'price_point_map') and map_key in self.price_point_map:
+                    p_val = self.price_point_map[map_key]
+                    if p_val > 0:
+                        info['points'] = f"{(p_val/min_price)*100:.1f}%"
             
-            # --- Plan E: 最後の手段（参考価格） ---
-            # 実売価格がどうしても取れなかった場合のみ表示
+            # どうしても取れなかった場合のみ参考価格
             elif list_price > 0:
                 info['price_disp'] = f"¥{list_price:,.0f} (参考)"
-                info['seller'] = 'Ref Price'
-                # info['price']は0のまま（計算には使わせない）
+                info['seller'] = 'Ref Only'
 
             # 3. 手数料 (Fees API)
             if info['price'] > 0:
