@@ -5,7 +5,7 @@ import random
 from datetime import datetime
 import pytz
 from sp_api.api import CatalogItems, Products, ProductFees
-from sp_api.base import Marketplaces, SellingApiForbiddenException, SellingApiRequestThrottledException
+from sp_api.base import Marketplaces
 
 # ページ設定
 st.set_page_config(page_title="Amazon SP-API Search Tool", layout="wide")
@@ -72,19 +72,18 @@ class AmazonSearcher:
         self.logs.append(f"[{ts}] {message}")
 
     def get_prices_batch(self, asin_list):
-        """【修正版】ASINリストを一括で価格取得する（バッチ処理）"""
+        """【修正済】ASINリストを一括で価格取得する（get_competitive_pricing_for_asinsを使用）"""
         products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
-        price_map = {} # {asin: {'price': 1000, 'seller': 'Amazon'}}
+        price_map = {} 
 
-        # 20件ずつ分割してリクエスト
         chunk_size = 20
         for i in range(0, len(asin_list), chunk_size):
             chunk = asin_list[i:i + chunk_size]
             self.log(f"Batch Requesting prices for {len(chunk)} items...")
             
             try:
-                # get_pricing は最大20件まで同時に取得可能
-                res = products_api.get_pricing(MarketplaceId=self.mp_id, Asins=chunk, ItemType='Asin')
+                # ★修正: メソッド名を正しいものに変更
+                res = products_api.get_competitive_pricing_for_asins(MarketplaceId=self.mp_id, Asins=chunk)
                 
                 if res and res.payload:
                     for item in res.payload:
@@ -94,7 +93,7 @@ class AmazonSearcher:
                         best_price = float('inf')
                         best_seller = 'Unknown'
                         
-                        # 1. Competitive Pricing (カート価格)
+                        # Competitive Pricing (カート価格)
                         comp = product.get('CompetitivePricing', {}).get('CompetitivePrices', [])
                         for cp in comp:
                             price_dict = cp.get('Price', {})
@@ -107,33 +106,18 @@ class AmazonSearcher:
                                     best_price = amount
                                     best_seller = 'Cart Price'
 
-                        # 2. Lowest Offer (最安値)
-                        lowest = product.get('LowestOfferListings', [])
-                        for lo in lowest:
-                            # 新品(New)のみ
-                            if (lo.get('Qualifiers') or {}).get('ItemCondition') == 'New':
-                                price_dict = lo.get('Price', {})
-                                landed = (price_dict.get('LandedPrice') or {}).get('Amount')
-                                listing = (price_dict.get('ListingPrice') or {}).get('Amount')
-                                amount = landed or listing
-                                
-                                if amount and amount > 0:
-                                    if amount < best_price:
-                                        best_price = amount
-                                        best_seller = 'Lowest Offer'
-
                         if best_price != float('inf'):
                             price_map[asin] = {
                                 'price': best_price,
                                 'seller': best_seller
                             }
-                            self.log(f"Found price for {asin}: {best_price}")
+                            self.log(f"Found batch price for {asin}: {best_price}")
                         else:
-                            self.log(f"No price found in batch for {asin}")
+                            self.log(f"No batch price for {asin}")
                 else:
-                    self.log(f"Batch response empty or invalid payload")
+                    self.log(f"Batch payload empty")
                 
-                time.sleep(1.0) # バッチ間の待機
+                time.sleep(1.0)
             except Exception as e:
                 self.log(f"Batch Error: {str(e)}")
                 pass
@@ -145,7 +129,6 @@ class AmazonSearcher:
         try:
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
             
-            # リトライ付きカタログ取得
             res = None
             for _ in range(3):
                 try:
@@ -212,8 +195,9 @@ class AmazonSearcher:
                 # バッチで取れなかった場合の個別取得 (最後の手段)
                 products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
                 try:
-                    # リトライなし・1回勝負（遅くなるので）
-                    offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id)
+                    # ★修正: ItemCondition='New' を必須引数として追加
+                    offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, ItemCondition='New')
+                    
                     if offers and offers.payload and 'Offers' in offers.payload:
                         best_p = float('inf')
                         best_s = ''
@@ -233,7 +217,7 @@ class AmazonSearcher:
                             info['seller'] = best_s
                             if best_pt > 0: info['points'] = f"{(best_pt/best_p)*100:.1f}%"
                 except Exception as e:
-                    self.log(f"Single fetch error {asin}: {e}")
+                    # self.log(f"Single fetch error {asin}: {e}") # ログがうるさくなるのでコメントアウト可
                     pass
 
             # 3. 参考価格フォールバック
@@ -281,7 +265,13 @@ class AmazonSearcher:
             if page_token: params['pageToken'] = page_token
 
             try:
-                res = catalog.search_catalog_items(**params)
+                res = None
+                for _ in range(3):
+                    try:
+                        res = catalog.search_catalog_items(**params)
+                        break
+                    except: time.sleep(1)
+                
                 if res and res.payload:
                     items = res.payload.get('items', [])
                     if not items: break
@@ -296,9 +286,7 @@ class AmazonSearcher:
                     if not page_token: break
                 else: break
                 time.sleep(1)
-            except Exception as e:
-                self.log(f"Search error: {e}")
-                break
+            except: break
         
         sorted_items = sorted(found_items, key=lambda x: x['rank'])
         return [item['asin'] for item in sorted_items][:max_results]
@@ -387,7 +375,6 @@ def main():
             st.error("商品が見つかりません")
             return
 
-        # バッチ取得復活（エラーハンドリング強化）
         st.success(f"{len(target_asins)}件のASINを特定。価格を一括取得します...")
         price_map = searcher.get_prices_batch(target_asins)
         
@@ -413,12 +400,11 @@ def main():
                 df_placeholder.dataframe(df[cols].rename(columns=disp), use_container_width=True)
 
             progress_bar.progress(min(0.3 + ((i+1)/len(target_asins)*0.7), 1.0))
-            time.sleep(0.2) # バッチを使っているので待機は短くてOK
+            time.sleep(0.2)
 
         status_text.success("完了！")
         progress_bar.progress(100)
 
-        # デバッグログ表示（エラー時に中身を確認できるようにする）
         with st.expander("デバッグログを表示 (API通信状況)"):
             for log in searcher.logs:
                 st.text(log)
