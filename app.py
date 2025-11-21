@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import time
 import random
+import json
+import os
+import requests
 from datetime import datetime
 import pytz
 from sp_api.api import CatalogItems, Products, ProductFees
@@ -12,25 +15,19 @@ st.set_page_config(page_title="Amazon SP-API Search Tool", layout="wide")
 
 # --- 認証機能 ---
 def check_password():
-    """簡易ログイン機能"""
     if "password_correct" not in st.session_state:
         st.session_state.password_correct = False
-
     if st.session_state.password_correct:
         return True
-
-    st.markdown("## 🔐 ログイン")
     
+    st.markdown("## 🔐 ログイン")
     col1, col2 = st.columns([1, 2])
     with col1:
         user_id = st.text_input("ユーザーID", key="login_user")
         password = st.text_input("パスワード", type="password", key="login_pass")
-        
         if st.button("ログイン"):
-            # GitHubで編集して、あなただけのID/PASSに変更してください
             ADMIN_USER = "admin"
             ADMIN_PASS = "password123"
-            
             if user_id == ADMIN_USER and password == ADMIN_PASS:
                 st.session_state.password_correct = True
                 st.rerun()
@@ -40,7 +37,6 @@ def check_password():
 
 # --- ユーティリティ関数 ---
 def calculate_shipping_fee(height, length, width):
-    """梱包サイズから送料を計算"""
     try:
         h, l, w = float(height), float(length), float(width)
         total_size = h + l + w
@@ -55,26 +51,81 @@ def calculate_shipping_fee(height, length, width):
         elif total_size <= 180: return 2500
         elif total_size <= 200: return 3000
         else: return 'N/A'
-    except:
-        return 'N/A'
+    except: return 'N/A'
+
+# --- Keepa & Seller Dictionary Logic ---
+class SellerNameResolver:
+    def __init__(self, keepa_key=None):
+        self.keepa_key = keepa_key
+        self.file_path = 'sellers.json'
+        self.seller_map = self._load_map()
+
+    def _load_map(self):
+        """ローカル辞書を読み込む"""
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except: return {}
+        return {}
+
+    def _save_map(self):
+        """ローカル辞書を保存する"""
+        try:
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                json.dump(self.seller_map, f, ensure_ascii=False, indent=2)
+        except: pass
+
+    def get_name(self, seller_id):
+        """セラーIDから名前を解決する（辞書 -> Amazon特殊ID -> Keepa）"""
+        if not seller_id: return "Unknown"
+        
+        # 1. Amazon公式
+        if seller_id == 'AN1VRQENFRJN5': return 'Amazon.co.jp'
+        
+        # 2. キャッシュ（辞書）チェック
+        if seller_id in self.seller_map:
+            return self.seller_map[seller_id]
+        
+        # 3. Keepa APIへ問い合わせ (1トークン消費)
+        if self.keepa_key:
+            try:
+                url = f"https://api.keepa.com/seller?key={self.keepa_key}&domain=5&seller={seller_id}"
+                res = requests.get(url, timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    if 'sellers' in data and data['sellers']:
+                        # Keepaからセラー名を取得
+                        seller_data = data['sellers'].get(seller_id, {})
+                        seller_name = seller_data.get('sellerName')
+                        
+                        if seller_name:
+                            # 辞書に登録して保存
+                            self.seller_map[seller_id] = seller_name
+                            self._save_map()
+                            return seller_name
+            except Exception as e:
+                print(f"Keepa error: {e}")
+        
+        return seller_id # 名前が取れなければIDを返す
 
 # --- SP-API ロジック ---
 class AmazonSearcher:
-    def __init__(self, credentials):
+    def __init__(self, credentials, keepa_key=None):
         self.credentials = credentials
         self.marketplace = Marketplaces.JP
         self.mp_id = 'A1VC38T7YXB528'
-        self.logs = [] 
+        self.logs = []
+        # Keepa連携クラスを初期化
+        self.resolver = SellerNameResolver(keepa_key)
 
     def log(self, message):
         ts = datetime.now().strftime('%H:%M:%S')
         self.logs.append(f"[{ts}] {message}")
 
     def _call_api_safely(self, func, **kwargs):
-        """API制限(429)を確実に回避する鉄壁のリトライ処理"""
         retries = 5
-        base_delay = 2.0 
-        
+        base_delay = 2.0
         for i in range(retries):
             try:
                 return func(**kwargs)
@@ -87,32 +138,11 @@ class AmazonSearcher:
                 return None
         return None
 
-    def get_seller_name(self, offer):
-        """【新機能】セラーIDを可能な限り店舗名に変換する"""
-        seller_id = offer.get('SellerId', 'Unknown')
-        
-        # 1. Amazon公式のID判定
-        if seller_id == 'AN1VRQENFRJN5':
-            return 'Amazon.co.jp'
-        
-        # 2. APIレスポンス内に名前があるか確認 (Sellerオブジェクト)
-        seller_obj = offer.get('Seller', {})
-        if 'Name' in seller_obj:
-            return seller_obj['Name']
-            
-        # 3. なければIDをそのまま返す
-        return seller_id
-
     def get_product_details_accurate(self, asin):
-        """【精度最優先】時間をかけて正確な価格とポイントを取得する"""
-        
-        # 1. 基本情報 (Catalog API)
+        # 1. Catalog API
         catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
-        
         res_cat = self._call_api_safely(
-            catalog.get_catalog_item,
-            asin=asin,
-            marketplaceIds=[self.mp_id],
+            catalog.get_catalog_item, asin=asin, marketplaceIds=[self.mp_id],
             includedData=['attributes', 'salesRanks', 'summaries']
         )
         
@@ -121,30 +151,22 @@ class AmazonSearcher:
             'rank': 999999, 'rank_disp': '', 'price': 0, 'price_disp': '-',
             'points': '', 'fee_rate': '', 'seller': '', 'size': '', 'shipping': ''
         }
-        
         list_price = 0
 
         if res_cat and res_cat.payload:
             data = res_cat.payload
-            if 'summaries' in data and data['summaries']:
-                info['title'] = data['summaries'][0].get('itemName', '')
-                info['brand'] = data['summaries'][0].get('brandName', '')
-
+            if 'summaries' in data: info['title'] = data['summaries'][0].get('itemName', '')
+            if 'summaries' in data: info['brand'] = data['summaries'][0].get('brandName', '')
+            
             if 'attributes' in data:
                 attrs = data['attributes']
                 if 'externally_assigned_product_identifier' in attrs:
                     for ext in attrs['externally_assigned_product_identifier']:
-                        if ext.get('type') == 'ean':
-                            info['jan'] = ext.get('value', '')
-                            break
-                
-                if 'list_price' in attrs and attrs['list_price']:
+                        if ext.get('type') == 'ean': info['jan'] = ext.get('value', '')
+                if 'list_price' in attrs:
                     for lp in attrs['list_price']:
-                        if lp.get('currency') == 'JPY':
-                            list_price = lp.get('value', 0)
-                            break
-                
-                if 'item_package_dimensions' in attrs and attrs['item_package_dimensions']:
+                        if lp.get('currency') == 'JPY': list_price = lp.get('value', 0)
+                if 'item_package_dimensions' in attrs:
                     dim = attrs['item_package_dimensions'][0]
                     h = (dim.get('height') or {}).get('value', 0)
                     l = (dim.get('length') or {}).get('value', 0)
@@ -152,38 +174,28 @@ class AmazonSearcher:
                     info['size'] = f"{h}x{l}x{w}"
                     s_fee = calculate_shipping_fee(h, l, w)
                     info['shipping'] = f"¥{s_fee}" if s_fee != 'N/A' else '-'
-
-            if 'salesRanks' in data and data['salesRanks']:
+            
+            if 'salesRanks' in data:
                 ranks = data['salesRanks'][0].get('ranks', [])
                 if ranks:
-                    r = ranks[0]
-                    info['category'] = r.get('title', '')
-                    info['rank'] = r.get('rank', 999999)
+                    info['category'] = ranks[0].get('title', '')
+                    info['rank'] = ranks[0].get('rank', 999999)
                     info['rank_disp'] = f"{info['rank']}位"
 
-        # 2. 価格とポイント (Products API)
+        # 2. Products API
         products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
-        time.sleep(1.5) 
-        
+        time.sleep(1.5)
         res_offers = self._call_api_safely(
-            products_api.get_item_offers,
-            asin=asin,
-            MarketplaceId=self.mp_id,
-            item_condition='New'
+            products_api.get_item_offers, asin=asin, MarketplaceId=self.mp_id, item_condition='New'
         )
 
         price_found = False
-        
         if res_offers and res_offers.payload and 'Offers' in res_offers.payload:
             target_offer = None
-            
-            # カート獲得者優先
             for offer in res_offers.payload['Offers']:
                 if offer.get('IsBuyBoxWinner', False):
                     target_offer = offer
                     break
-            
-            # カートなしなら最安値
             if not target_offer:
                 best_p = float('inf')
                 for offer in res_offers.payload['Offers']:
@@ -197,68 +209,52 @@ class AmazonSearcher:
             if target_offer:
                 p = (target_offer.get('ListingPrice') or {}).get('Amount', 0)
                 s = (target_offer.get('Shipping') or {}).get('Amount', 0)
-                total_price = p + s 
-                
+                total_price = p + s
                 pt_data = target_offer.get('Points', {})
                 points = pt_data.get('PointsNumber', 0)
                 
                 if total_price > 0:
                     info['price'] = total_price
                     info['price_disp'] = f"¥{total_price:,.0f}"
+                    if points > 0: info['points'] = f"{(points/total_price)*100:.1f}%"
                     
-                    # ★ここでセラーIDを名前に変換
-                    info['seller'] = self.get_seller_name(target_offer)
-                    
-                    if points > 0:
-                        info['points'] = f"{(points/total_price)*100:.1f}%"
+                    # ★Keepaを使ってセラー名を解決
+                    seller_id = target_offer.get('SellerId', '')
+                    info['seller'] = self.resolver.get_name(seller_id)
                     
                     price_found = True
 
-        # 3. 参考価格フォールバック
         if not price_found and list_price > 0:
             info['price_disp'] = f"¥{list_price:,.0f} (参考)"
             info['seller'] = 'Ref Only'
 
-        # 4. 手数料
+        # 3. Fees API
         if info['price'] > 0:
-            time.sleep(0.5) 
+            time.sleep(0.5)
             fees_api = ProductFees(credentials=self.credentials, marketplace=self.marketplace)
             res_fee = self._call_api_safely(
                 fees_api.get_product_fees_estimate_for_asin,
-                asin=asin, 
-                price=info['price'], 
-                is_fba=True, 
-                identifier=f'fee-{asin}', 
-                currency='JPY', 
-                marketplace_id=self.mp_id
+                asin=asin, price=info['price'], is_fba=True, identifier=f'fee-{asin}', currency='JPY', marketplace_id=self.mp_id
             )
-            
             if res_fee and res_fee.payload:
                 fees = res_fee.payload.get('FeesEstimateResult', {}).get('FeesEstimate', {}).get('FeeDetailList', [])
                 for fee in fees:
                     if fee.get('FeeType') == 'ReferralFee':
                         amt = (fee.get('FinalFee') or {}).get('Amount', 0)
-                        if amt > 0:
-                            info['fee_rate'] = f"{(amt/info['price'])*100:.1f}%"
+                        if amt > 0: info['fee_rate'] = f"{(amt/info['price'])*100:.1f}%"
 
         return info
 
     def search_by_keywords(self, keywords, max_results):
-        """キーワード検索"""
         catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
         found_items = []
         page_token = None
-        
         scan_limit = int(max_results * 1.5)
         if scan_limit < 20: scan_limit = 20
 
         while len(found_items) < scan_limit:
-            params = {
-                'keywords': [keywords], 'marketplaceIds': [self.mp_id],
-                'includedData': ['salesRanks'], 'pageSize': 20
-            }
+            params = {'keywords': [keywords], 'marketplaceIds': [self.mp_id], 'includedData': ['salesRanks'], 'pageSize': 20}
             if page_token: params['pageToken'] = page_token
-
             res = self._call_api_safely(catalog.search_catalog_items, **params)
             if res and res.payload:
                 items = res.payload.get('items', [])
@@ -267,8 +263,8 @@ class AmazonSearcher:
                     asin = item.get('asin')
                     rank_val = 9999999 
                     if 'salesRanks' in item and item['salesRanks']:
-                        ranks_list = item['salesRanks'][0].get('ranks', [])
-                        if ranks_list: rank_val = ranks_list[0].get('rank', 9999999)
+                        ranks = item['salesRanks'][0].get('ranks', [])
+                        if ranks: rank_val = ranks[0].get('rank', 9999999)
                     found_items.append({'asin': asin, 'rank': rank_val})
                 page_token = res.next_token
                 if not page_token: break
@@ -279,7 +275,6 @@ class AmazonSearcher:
         return [item['asin'] for item in sorted_items][:max_results]
 
     def search_by_jan(self, jan_code):
-        """JAN検索"""
         catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
         res = self._call_api_safely(catalog.search_catalog_items, keywords=[jan_code], marketplaceIds=[self.mp_id])
         if res and res.payload and 'items' in res.payload:
@@ -291,7 +286,7 @@ class AmazonSearcher:
 def main():
     if not check_password(): return
 
-    st.title("📦 Amazon SP-API 商品リサーチツール")
+    st.title("📦 Amazon SP-API 商品リサーチツール (Keepa連携版)")
 
     with st.sidebar:
         st.header("⚙️ 設定")
@@ -302,6 +297,7 @@ def main():
             refresh_token = st.secrets["REFRESH_TOKEN"]
             aws_access_key = st.secrets["AWS_ACCESS_KEY"]
             aws_secret_key = st.secrets["AWS_SECRET_KEY"]
+            keepa_key = st.secrets.get("KEEPA_API_KEY", "")
         else:
             st.warning("Secrets未設定")
             lwa_app_id = st.text_input("LWA App ID", type="password")
@@ -309,6 +305,7 @@ def main():
             refresh_token = st.text_input("Refresh Token", type="password")
             aws_access_key = st.text_input("AWS Access Key", type="password")
             aws_secret_key = st.text_input("AWS Secret Key", type="password")
+            keepa_key = st.text_input("Keepa API Key (Optional)", type="password")
 
     st.markdown("### 🔍 検索条件")
     col_mode, col_limit = st.columns([2, 1])
@@ -335,7 +332,7 @@ def main():
             'role_arn': st.secrets.get("ROLE_ARN", "")
         }
 
-        searcher = AmazonSearcher(credentials)
+        searcher = AmazonSearcher(credentials, keepa_key=keepa_key)
         target_asins = []
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -360,7 +357,7 @@ def main():
             st.error("商品が見つかりません")
             return
 
-        st.success(f"{len(target_asins)}件のASINを特定。高精度モードで取得します...")
+        st.success(f"{len(target_asins)}件のASINを特定。詳細を取得します...")
         
         results = []
         df_placeholder = st.empty()
@@ -369,7 +366,6 @@ def main():
             status_text.text(f"詳細取得中 ({i+1}/{len(target_asins)}): {asin}")
             
             detail = searcher.get_product_details_accurate(asin)
-            
             if detail: results.append(detail)
             
             if results:
@@ -386,10 +382,6 @@ def main():
 
         status_text.success("完了！")
         progress_bar.progress(100)
-
-        with st.expander("デバッグログを表示"):
-            for log in searcher.logs:
-                st.text(log)
 
         if results:
             df_final = pd.DataFrame(results)
