@@ -67,14 +67,16 @@ class AmazonSearcher:
         self.mp_id = 'A1VC38T7YXB528'
 
     def get_product_details(self, asin):
-        """ASINから詳細情報を取得（強力な価格取得ロジック搭載）"""
+        """ASINから詳細情報を取得（セール価格対応・3段階バックアップ）"""
         try:
-            # 1. Catalog API (基本情報)
+            # 1. Catalog API (基本情報 + Plan C用の予備価格情報)
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
+            
+            # includedDataに 'offers' を追加して、カタログレベルでの価格情報を取得
             res = catalog.get_catalog_item(
                 asin=asin,
                 marketplaceIds=[self.mp_id],
-                includedData=['attributes', 'salesRanks', 'summaries']
+                includedData=['attributes', 'salesRanks', 'summaries', 'offers'] 
             )
             
             info = {
@@ -83,7 +85,10 @@ class AmazonSearcher:
                 'points': '', 'fee_rate': '', 'seller': '', 'size': '', 'shipping': ''
             }
 
+            catalog_payload = None # 後で使うために保存
+
             if res and res.payload:
+                catalog_payload = res.payload
                 data = res.payload
                 
                 # 基本情報
@@ -119,10 +124,11 @@ class AmazonSearcher:
                         info['rank'] = r.get('rank', 999999)
                         info['rank_disp'] = f"{info['rank']}位"
 
-            # 2. 価格情報 (Products API)
+            # 2. 価格取得フェーズ (Plan A -> Plan B -> Plan C)
             products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
             
-            # --- Plan A: get_item_offers (詳細なオファー情報を取得) ---
+            # --- Plan A: get_item_offers (詳細な出品者情報から取得) ---
+            # 通常の商品や、カート獲得者が明確な場合に最強
             try:
                 offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, item_condition='New')
                 
@@ -162,35 +168,45 @@ class AmazonSearcher:
             except Exception:
                 pass
 
-            # --- Plan B: get_pricing (Plan Aで取れなかった場合のバックアップ) ---
+            # --- Plan B: get_pricing (Plan A失敗時のバックアップ) ---
+            # カートボックス価格や競争力のある価格をAPIに問い合わせる
             if info['price'] == 0:
                 try:
                     price_res = products_api.get_pricing(MarketplaceId=self.mp_id, Asins=[asin], ItemType='Asin')
                     if price_res and price_res.payload:
                         product_data = price_res.payload[0].get('Product', {})
                         
-                        # 優先順位1: Competitive Price (カート価格相当)
+                        # Competitive Price (カート価格相当)
                         comp_prices = product_data.get('CompetitivePricing', {}).get('CompetitivePrices', [])
                         if comp_prices:
-                            # LandedPrice(送料込)があればそれを、なければListingPriceを使う
                             price_obj = comp_prices[0].get('Price', {})
                             amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
                             
                             if amount > 0:
                                 info['price'] = amount
                                 info['price_disp'] = f"¥{amount:,.0f}"
-                                info['seller'] = 'Amazon/Others' # 取得元が特定できないため
-                        
-                        # 優先順位2: Lowest Offer (最安値情報)
-                        if info['price'] == 0:
-                            lowest = product_data.get('LowestOfferListings', [])
-                            if lowest:
-                                price_obj = lowest[0].get('Price', {})
-                                amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
-                                
-                                if amount > 0:
-                                    info['price'] = amount
-                                    info['price_disp'] = f"¥{amount:,.0f}"
+                                info['seller'] = 'Amazon/Others'
+                except Exception:
+                    pass
+
+            # --- Plan C: Catalog API Offers (セール品対応の最終兵器) ---
+            # ブラックフライデーなどのセール価格はここに含まれることが多い
+            if info['price'] == 0 and catalog_payload and 'offers' in catalog_payload:
+                try:
+                    cat_offers = catalog_payload['offers']
+                    if cat_offers:
+                        # カタログの価格情報から価格を探す
+                        for offer in cat_offers:
+                            p = offer.get('price', {}).get('amount', 0)
+                            if p == 0:
+                                # ListingPrice構造の場合もあるのでチェック
+                                p = offer.get('listingPrice', {}).get('amount', 0)
+                            
+                            if p > 0:
+                                info['price'] = p
+                                info['price_disp'] = f"¥{p:,.0f}"
+                                info['seller'] = 'Amazon Deal' # セール情報の可能性大
+                                break # 最初に見つかった価格を採用
                 except Exception:
                     pass
 
