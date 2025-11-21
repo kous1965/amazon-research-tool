@@ -67,7 +67,7 @@ class AmazonSearcher:
         self.mp_id = 'A1VC38T7YXB528'
 
     def get_product_details(self, asin):
-        """ASINから詳細情報を取得"""
+        """ASINから詳細情報を取得（最安値フォールバック機能付き）"""
         try:
             # Catalog API
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
@@ -120,25 +120,48 @@ class AmazonSearcher:
                         info['rank_disp'] = f"{info['rank']}位"
 
             # 価格・カート情報 (Products API)
+            # カート獲得者がいない場合は最安値を採用するロジック
             try:
                 products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
                 offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, item_condition='New')
                 
                 if offers and offers.payload and 'Offers' in offers.payload:
+                    found_buybox = False
+                    lowest_price = float('inf')
+                    best_offer = None
+
+                    # 全オファーをチェック
                     for offer in offers.payload['Offers']:
+                        listing_price = offer.get('ListingPrice', {}).get('Amount', 0)
+                        shipping = offer.get('Shipping', {}).get('Amount', 0)
+                        total_price = listing_price + shipping
+                        
+                        if total_price == 0: continue
+
+                        # 1. カート獲得者を優先
                         if offer.get('IsBuyBoxWinner', False):
-                            price = offer.get('ListingPrice', {}).get('Amount', 0)
-                            shipping = offer.get('Shipping', {}).get('Amount', 0)
-                            points = offer.get('Points', {}).get('PointsNumber', 0)
-                            
-                            total_price = price + shipping
+                            best_offer = offer
                             info['price'] = total_price
-                            info['price_disp'] = f"¥{total_price:,.0f}"
-                            info['seller'] = offer.get('SellerId', '')
-                            
-                            if points > 0 and total_price > 0:
-                                info['points'] = f"{(points/total_price)*100:.1f}%"
-                            break
+                            found_buybox = True
+                            break # カート獲得者が見つかれば即決定
+                        
+                        # 2. 最安値を記録（カート未発見時の保険）
+                        if total_price < lowest_price:
+                            lowest_price = total_price
+                            if not found_buybox:
+                                best_offer = offer
+                                info['price'] = total_price
+
+                    # 最終的な価格情報をセット
+                    if best_offer:
+                        p = info['price']
+                        info['price_disp'] = f"¥{p:,.0f}"
+                        info['seller'] = best_offer.get('SellerId', '')
+                        
+                        points = best_offer.get('Points', {}).get('PointsNumber', 0)
+                        if points > 0 and p > 0:
+                            info['points'] = f"{(points/p)*100:.1f}%"
+
             except Exception:
                 pass # 価格取得エラーは無視
 
@@ -244,7 +267,7 @@ def main():
     if not check_password():
         return
 
-    st.title("📦 Amazon SP-API 商品リサーチツール（made by 岡田屋）")
+    st.title("📦 Amazon SP-API 商品リサーチツール")
 
     # サイドバー：API設定（Secrets対応版）
     with st.sidebar:
