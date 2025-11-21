@@ -26,9 +26,9 @@ def check_password():
         password = st.text_input("パスワード", type="password", key="login_pass")
         
         if st.button("ログイン"):
-            # ここでIDとパスワードを設定（本番運用時は環境変数などで管理推奨）
-            ADMIN_USER = "Okadaya"
-            ADMIN_PASS = "Akio6583a"  # 任意のパスワードに変更してください
+            # GitHubで編集して、あなただけのID/PASSに変更してください
+            ADMIN_USER = "admin"
+            ADMIN_PASS = "password123"
             
             if user_id == ADMIN_USER and password == ADMIN_PASS:
                 st.session_state.password_correct = True
@@ -39,11 +39,12 @@ def check_password():
 
 # --- ユーティリティ関数 ---
 def calculate_shipping_fee(height, length, width):
-    """梱包サイズから送料を計算 (旧sp_api_app.pyより移植)"""
+    """梱包サイズから送料を計算"""
     try:
         h, l, w = float(height), float(length), float(width)
         total_size = h + l + w
         
+        # 送料計算ルール（必要に応じて金額を修正してください）
         if h <= 3 and total_size < 60: return 290
         elif total_size <= 60: return 580
         elif total_size <= 80: return 670
@@ -109,11 +110,11 @@ class AmazonSearcher:
                         s_fee = calculate_shipping_fee(h, l, w)
                         info['shipping'] = f"¥{s_fee}" if s_fee != 'N/A' else '-'
 
-                # ランキング
+                # ランキング（大分類を取得するように修正済み）
                 if 'salesRanks' in data and data['salesRanks']:
                     ranks = data['salesRanks'][0].get('ranks', [])
                     if ranks:
-                        r = ranks[0]   # ← 「最初（大分類）」に変更
+                        r = ranks[0]  # ranks[0] = 大分類, ranks[-1] = 小分類
                         info['category'] = r.get('title', '')
                         info['rank'] = r.get('rank', 999999)
                         info['rank_disp'] = f"{info['rank']}位"
@@ -166,17 +167,23 @@ class AmazonSearcher:
             return None
 
     def search_by_keywords(self, keywords, max_results):
-        """キーワード（ブランド/カテゴリ/任意）で検索してASINリストを取得"""
+        """キーワード検索後、ランキング順（昇順）にソートしてASINを取得"""
         catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
-        all_asins = []
+        
+        found_items = []
         page_token = None
         
         status_text = st.empty()
         
-        while len(all_asins) < max_results:
+        # 適合度順で返るため、ランキング順にするために1.5倍程度スキャンしてからソートする
+        scan_limit = int(max_results * 1.5)
+        if scan_limit < 20: scan_limit = 20
+
+        while len(found_items) < scan_limit:
             params = {
                 'keywords': [keywords],
                 'marketplaceIds': [self.mp_id],
+                'includedData': ['salesRanks'],
                 'pageSize': 20
             }
             if page_token:
@@ -189,21 +196,35 @@ class AmazonSearcher:
                     if not items: break
                     
                     for item in items:
-                        if len(all_asins) >= max_results: break
-                        all_asins.append(item.get('asin'))
+                        asin = item.get('asin')
+                        rank_val = 9999999 # ランキングがない場合のデフォルト値
+                        
+                        if 'salesRanks' in item and item['salesRanks']:
+                            ranks_list = item['salesRanks'][0].get('ranks', [])
+                            if ranks_list:
+                                # ranks[0]が大分類
+                                rank_val = ranks_list[0].get('rank', 9999999)
+                        
+                        found_items.append({'asin': asin, 'rank': rank_val})
                     
-                    status_text.text(f"検索中... {len(all_asins)}件 ヒット")
+                    status_text.text(f"候補を検索中... {len(found_items)}件 取得")
                     
                     page_token = res.next_token
                     if not page_token: break
                 else:
                     break
-                time.sleep(1) # API制限対策
+                time.sleep(1)
             except Exception as e:
                 st.error(f"検索エラー: {e}")
                 break
-                
-        return all_asins[:max_results]
+        
+        # ランキング順（昇順）に並び替え
+        sorted_items = sorted(found_items, key=lambda x: x['rank'])
+        
+        # 上位から指定件数分だけASINリストにして返す
+        final_asins = [item['asin'] for item in sorted_items][:max_results]
+        
+        return final_asins
 
     def search_by_jan(self, jan_code):
         """JANコードからASINを取得"""
@@ -223,25 +244,22 @@ def main():
     if not check_password():
         return
 
-    st.title("📦 Amazon SP-API 商品リサーチツール(made by 岡田屋)")
+    st.title("📦 Amazon SP-API 商品リサーチツール")
 
-# サイドバー：API設定
+    # サイドバー：API設定（Secrets対応版）
     with st.sidebar:
         st.header("⚙️ 設定")
         
-        # Secretsに設定があるか確認
         if "LWA_APP_ID" in st.secrets:
-            st.success("✅ 認証情報はクラウド設定から読み込まれました")
+            st.success("✅ 認証情報は設定済みです")
             st.info("キーは安全に保護されています。")
             
-            # 変数に直接代入（画面には表示しない）
             lwa_app_id = st.secrets["LWA_APP_ID"]
             lwa_client_secret = st.secrets["LWA_CLIENT_SECRET"]
             refresh_token = st.secrets["REFRESH_TOKEN"]
             aws_access_key = st.secrets["AWS_ACCESS_KEY"]
             aws_secret_key = st.secrets["AWS_SECRET_KEY"]
         else:
-            # Secretsがない場合のみ入力欄を表示（テスト用など）
             st.warning("Secretsが設定されていません。手動入力してください。")
             lwa_app_id = st.text_input("LWA App ID", type="password")
             lwa_client_secret = st.text_input("LWA Client Secret", type="password")
@@ -262,7 +280,7 @@ def main():
     with col_limit:
         max_results = st.slider("取得件数上限", 10, 200, 50, 10)
 
-    # 入力エリアの動的変更
+    # 入力エリア
     input_data = ""
     if search_mode in ["JANコードリスト", "ASINリスト"]:
         input_data = st.text_area(f"{search_mode}を入力 (1行に1つ)", height=150)
@@ -279,20 +297,19 @@ def main():
             st.warning("検索キーワードまたはリストを入力してください。")
             return
 
-        # クレデンシャル作成
+        # クレデンシャル
         credentials = {
             'refresh_token': refresh_token,
             'lwa_app_id': lwa_app_id,
             'lwa_client_secret': lwa_client_secret,
             'aws_access_key': aws_access_key,
             'aws_secret_key': aws_secret_key,
-            'role_arn': st.secrets.get("ROLE_ARN", "") # 必要であれば入力項目追加
+            'role_arn': st.secrets.get("ROLE_ARN", "")
         }
 
         searcher = AmazonSearcher(credentials)
         target_asins = []
 
-        # プログレス表示用コンテナ
         progress_bar = st.progress(0)
         status_text = st.empty()
         result_container = st.container()
@@ -308,7 +325,7 @@ def main():
                 if asin:
                     target_asins.append(asin)
                 time.sleep(0.5)
-                progress_bar.progress((i + 1) / len(jan_list) * 0.3) # 前半30%
+                progress_bar.progress((i + 1) / len(jan_list) * 0.3)
 
         elif search_mode == "ASINリスト":
             target_asins = [line.strip() for line in input_data.split('\n') if line.strip()]
@@ -326,33 +343,30 @@ def main():
         
         # 2. 詳細情報の取得
         results = []
-        
-        # プレースホルダーにテーブルの枠だけ作っておく
         df_placeholder = st.empty()
         
         for i, asin in enumerate(target_asins):
             status_text.text(f"詳細データ取得中: {asin} ({i+1}/{len(target_asins)})")
             
-            # API制限に達しないよう少し待機
             time.sleep(1.5) 
             
             detail = searcher.get_product_details(asin)
             if detail:
                 results.append(detail)
             
-            # 途中経過をデータフレームとして更新表示 (常時表示)
             if results:
                 df_current = pd.DataFrame(results)
-                # 表示用にカラムを整理
+                # 表示用カラム
                 display_cols = {
                     'title': '商品名', 'brand': 'ブランド', 'price_disp': '価格', 
                     'rank_disp': 'ランキング', 'category': 'カテゴリ',
                     'points': 'ポイント率', 'fee_rate': '手数料率', 'asin': 'ASIN'
                 }
-                df_show = df_current[display_cols.keys()].rename(columns=display_cols)
+                # 表示用に不要な列を除外してリネーム
+                cols_to_show = [c for c in display_cols.keys() if c in df_current.columns]
+                df_show = df_current[cols_to_show].rename(columns=display_cols)
                 df_placeholder.dataframe(df_show, use_container_width=True)
 
-            # 進捗バー更新 (残り70%分)
             current_progress = 0.3 + ((i + 1) / len(target_asins) * 0.7)
             progress_bar.progress(min(current_progress, 1.0))
 
@@ -363,8 +377,7 @@ def main():
         if results:
             df_final = pd.DataFrame(results)
             
-            # ★追加: 不要な列（rank, price）をCSVから削除する
-            # ※ rank_disp（ランキング表示用）や price_disp（価格表示用）は残ります
+            # 不要な列（生の数値データ）をCSVから削除
             df_final = df_final.drop(columns=['rank', 'price'], errors='ignore')
 
             # 日本時間の日付ファイル名
