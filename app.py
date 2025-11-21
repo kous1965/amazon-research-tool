@@ -27,8 +27,8 @@ def check_password():
         
         if st.button("ログイン"):
             # ここでIDとパスワードを設定（本番運用時は環境変数などで管理推奨）
-            ADMIN_USER = "admin"
-            ADMIN_PASS = "password123"  # 任意のパスワードに変更してください
+            ADMIN_USER = "Okadaya"
+            ADMIN_PASS = "Akio6583a"  # 任意のパスワードに変更してください
             
             if user_id == ADMIN_USER and password == ADMIN_PASS:
                 st.session_state.password_correct = True
