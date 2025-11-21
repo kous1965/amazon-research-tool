@@ -72,7 +72,7 @@ class AmazonSearcher:
         self.logs.append(f"[{ts}] {message}")
 
     def get_prices_batch(self, asin_list):
-        """【修正済】ASINリストを一括で価格取得する（get_competitive_pricing_for_asinsを使用）"""
+        """【修正済】ASINリストを一括で価格取得する"""
         products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
         price_map = {} 
 
@@ -82,8 +82,8 @@ class AmazonSearcher:
             self.log(f"Batch Requesting prices for {len(chunk)} items...")
             
             try:
-                # ★修正: メソッド名を正しいものに変更
-                res = products_api.get_competitive_pricing_for_asins(MarketplaceId=self.mp_id, Asins=chunk)
+                # ★修正: 第一引数(asin_list)として chunk をそのまま渡す
+                res = products_api.get_competitive_pricing_for_asins(chunk, MarketplaceId=self.mp_id)
                 
                 if res and res.payload:
                     for item in res.payload:
@@ -105,6 +105,21 @@ class AmazonSearcher:
                                 if amount < best_price:
                                     best_price = amount
                                     best_seller = 'Cart Price'
+
+                        # Lowest Offer (最安値)
+                        lowest = product.get('LowestOfferListings', [])
+                        for lo in lowest:
+                            # 新品(New)のみ
+                            if (lo.get('Qualifiers') or {}).get('ItemCondition') == 'New':
+                                price_dict = lo.get('Price', {})
+                                landed = (price_dict.get('LandedPrice') or {}).get('Amount')
+                                listing = (price_dict.get('ListingPrice') or {}).get('Amount')
+                                amount = landed or listing
+                                
+                                if amount and amount > 0:
+                                    if amount < best_price:
+                                        best_price = amount
+                                        best_seller = 'Lowest Offer'
 
                         if best_price != float('inf'):
                             price_map[asin] = {
@@ -195,8 +210,8 @@ class AmazonSearcher:
                 # バッチで取れなかった場合の個別取得 (最後の手段)
                 products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
                 try:
-                    # ★修正: ItemCondition='New' を必須引数として追加
-                    offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, ItemCondition='New')
+                    # ★修正: item_condition (小文字) で指定
+                    offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, item_condition='New')
                     
                     if offers and offers.payload and 'Offers' in offers.payload:
                         best_p = float('inf')
@@ -217,7 +232,7 @@ class AmazonSearcher:
                             info['seller'] = best_s
                             if best_pt > 0: info['points'] = f"{(best_pt/best_p)*100:.1f}%"
                 except Exception as e:
-                    # self.log(f"Single fetch error {asin}: {e}") # ログがうるさくなるのでコメントアウト可
+                    # self.log(f"Single fetch error {asin}: {e}") 
                     pass
 
             # 3. 参考価格フォールバック
@@ -253,6 +268,7 @@ class AmazonSearcher:
         catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
         found_items = []
         page_token = None
+        status_text = st.empty()
         
         scan_limit = int(max_results * 1.5)
         if scan_limit < 20: scan_limit = 20
@@ -282,6 +298,7 @@ class AmazonSearcher:
                             ranks_list = item['salesRanks'][0].get('ranks', [])
                             if ranks_list: rank_val = ranks_list[0].get('rank', 9999999)
                         found_items.append({'asin': asin, 'rank': rank_val})
+                    status_text.text(f"候補を検索中... {len(found_items)}件 取得")
                     page_token = res.next_token
                     if not page_token: break
                 else: break
