@@ -65,87 +65,15 @@ class AmazonSearcher:
         self.marketplace = Marketplaces.JP
         self.mp_id = 'A1VC38T7YXB528'
 
-    def get_prices_batch(self, asin_list):
-        """一括価格取得（リトライ処理内蔵版）"""
-        products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
-        price_map = {} 
-
-        chunk_size = 20
-        for i in range(0, len(asin_list), chunk_size):
-            chunk = asin_list[i:i + chunk_size]
-            
-            # ★ここを修正: シンプルな再試行ループに変更
-            for attempt in range(3):
-                try:
-                    res = products_api.get_pricing(
-                        MarketplaceId=self.mp_id, 
-                        Asins=chunk, 
-                        ItemType='Asin'
-                    )
-                    
-                    if res and res.payload:
-                        for item in res.payload:
-                            asin = item.get('ASIN')
-                            product = item.get('Product', {})
-                            
-                            best_price = float('inf')
-                            best_seller = 'Unknown'
-                            
-                            # 1. Competitive Pricing
-                            comp = product.get('CompetitivePricing', {}).get('CompetitivePrices', [])
-                            for cp in comp:
-                                price_dict = cp.get('Price', {})
-                                landed = (price_dict.get('LandedPrice') or {}).get('Amount')
-                                listing = (price_dict.get('ListingPrice') or {}).get('Amount')
-                                amount = landed or listing
-                                
-                                if amount and amount > 0:
-                                    if amount < best_price:
-                                        best_price = amount
-                                        best_seller = 'Cart Price'
-
-                            # 2. Lowest Offer
-                            lowest = product.get('LowestOfferListings', [])
-                            for lo in lowest:
-                                if (lo.get('Qualifiers') or {}).get('ItemCondition') == 'New':
-                                    price_dict = lo.get('Price', {})
-                                    landed = (price_dict.get('LandedPrice') or {}).get('Amount')
-                                    listing = (price_dict.get('ListingPrice') or {}).get('Amount')
-                                    amount = landed or listing
-                                    
-                                    if amount and amount > 0:
-                                        if amount < best_price:
-                                            best_price = amount
-                                            best_seller = 'Lowest Offer'
-
-                            if best_price != float('inf'):
-                                price_map[asin] = {
-                                    'price': best_price,
-                                    'seller': best_seller
-                                }
-                        # 成功したらループを抜ける
-                        break 
-                        
-                except Exception as e:
-                    # エラー時は少し待って再挑戦
-                    if attempt < 2:
-                        time.sleep(2.0 + random.uniform(0, 1))
-                    else:
-                        print(f"Batch fetch failed: {e}")
-            
-            time.sleep(1.0)
-        
-        return price_map
-
-    def get_product_details(self, asin, pre_fetched_price_data=None):
-        """詳細情報取得（リトライ処理内蔵版）"""
+    def get_product_details(self, asin):
+        """ASINから詳細情報を取得（低速・確実モード）"""
         try:
-            # 1. Catalog API
+            # 1. Catalog API (基本情報)
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
             
-            # リトライループ
+            # リトライロジック
             res = None
-            for attempt in range(3):
+            for _ in range(3):
                 try:
                     res = catalog.get_catalog_item(
                         asin=asin,
@@ -154,7 +82,7 @@ class AmazonSearcher:
                     )
                     break
                 except Exception:
-                    time.sleep(1.0)
+                    time.sleep(1.5)
             
             info = {
                 'asin': asin, 'jan': '', 'title': '', 'brand': '', 'category': '',
@@ -201,55 +129,79 @@ class AmazonSearcher:
                         info['rank'] = r.get('rank', 999999)
                         info['rank_disp'] = f"{info['rank']}位"
 
-            # 2. 価格適用
-            if pre_fetched_price_data:
-                info['price'] = pre_fetched_price_data['price']
-                info['price_disp'] = f"¥{info['price']:,.0f}"
-                info['seller'] = pre_fetched_price_data['seller']
+            # 2. 価格取得フェーズ（個別・総当たり）
+            products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
+            collected_prices = [] # 取得できた価格を全部入れる
             
-            else:
-                # バッチ失敗時の個別取得
-                products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
-                
-                # リトライループ（全コンディション取得）
-                offers = None
-                for attempt in range(3):
-                    try:
-                        offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id)
-                        break
-                    except Exception:
-                        time.sleep(2.0)
-                
-                if offers and offers.payload and 'Offers' in offers.payload:
-                    best_p = float('inf')
-                    best_s = ''
-                    best_pt = 0
+            # API呼び出し前の待機（重要）
+            time.sleep(0.5)
+
+            # (A) get_pricing API (カート価格・最安値)
+            try:
+                price_res = products_api.get_pricing(MarketplaceId=self.mp_id, Asins=[asin], ItemType='Asin')
+                if price_res and price_res.payload:
+                    product = price_res.payload[0].get('Product', {})
                     
+                    # Competitive Price
+                    for cp in product.get('CompetitivePricing', {}).get('CompetitivePrices', []):
+                        price_obj = cp.get('Price', {})
+                        amt = (price_obj.get('LandedPrice') or {}).get('Amount') or (price_obj.get('ListingPrice') or {}).get('Amount')
+                        if amt and amt > 0: collected_prices.append(amt)
+
+                    # Lowest Offer
+                    for lo in product.get('LowestOfferListings', []):
+                        price_obj = lo.get('Price', {})
+                        amt = (price_obj.get('LandedPrice') or {}).get('Amount') or (price_obj.get('ListingPrice') or {}).get('Amount')
+                        if amt and amt > 0: collected_prices.append(amt)
+            except Exception:
+                pass
+
+            # API呼び出し間の待機（重要）
+            time.sleep(0.5)
+
+            # (B) get_item_offers API (全出品情報)
+            # ここでセール価格などを確実に拾う
+            try:
+                # 全コンディション取得 (item_condition指定なし)
+                offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id)
+                if offers and offers.payload and 'Offers' in offers.payload:
                     for offer in offers.payload['Offers']:
                         p = (offer.get('ListingPrice') or {}).get('Amount', 0)
                         s = (offer.get('Shipping') or {}).get('Amount', 0)
                         total = p + s
                         
-                        if total > 0 and total < best_p:
-                            best_p = total
-                            best_s = offer.get('SellerId', '')
-                            best_pt = (offer.get('Points') or {}).get('PointsNumber', 0)
-                    
-                    if best_p != float('inf'):
-                        info['price'] = best_p
-                        info['price_disp'] = f"¥{best_p:,.0f}"
-                        info['seller'] = best_s
-                        if best_pt > 0:
-                            info['points'] = f"{(best_pt/best_p)*100:.1f}%"
+                        if total > 0:
+                            collected_prices.append(total)
+                            
+                            # ポイント情報の保存（最安値だった場合に使用）
+                            if not hasattr(self, 'price_point_map'): self.price_point_map = {}
+                            pt = (offer.get('Points') or {}).get('PointsNumber', 0)
+                            self.price_point_map[f"{asin}_{total}"] = pt
+            except Exception:
+                pass
 
-            # 3. 参考価格フォールバック
-            if info['price'] == 0 and list_price > 0:
+            # 3. 最安値の採用
+            if collected_prices:
+                min_price = min(collected_prices)
+                info['price'] = min_price
+                info['price_disp'] = f"¥{min_price:,.0f}"
+                info['seller'] = 'Best Price'
+                
+                # ポイント復元
+                map_key = f"{asin}_{min_price}"
+                if hasattr(self, 'price_point_map') and map_key in self.price_point_map:
+                    pt = self.price_point_map[map_key]
+                    if pt > 0: info['points'] = f"{(pt/min_price)*100:.1f}%"
+            
+            # 4. 参考価格フォールバック (実売価格が取れなかった場合のみ)
+            elif list_price > 0:
                 info['price_disp'] = f"¥{list_price:,.0f} (参考)"
                 info['seller'] = 'Ref Only'
 
-            # 4. 手数料
+            # 5. 手数料計算
             if info['price'] > 0:
                 try:
+                    time.sleep(0.2) # 手数料API前も少し待つ
                     fees_api = ProductFees(credentials=self.credentials, marketplace=self.marketplace)
                     f_res = fees_api.get_product_fees_estimate_for_asin(
                         asin=asin, price=info['price'], is_fba=True, 
@@ -289,14 +241,12 @@ class AmazonSearcher:
             if page_token: params['pageToken'] = page_token
 
             try:
-                # ここもシンプルリトライ
                 res = None
-                for _ in range(3):
+                for _ in range(3): # リトライ
                     try:
                         res = catalog.search_catalog_items(**params)
                         break
-                    except:
-                        time.sleep(1)
+                    except: time.sleep(1)
                 
                 if res and res.payload:
                     items = res.payload.get('items', [])
@@ -402,17 +352,17 @@ def main():
             st.error("商品が見つかりません")
             return
 
-        st.success(f"{len(target_asins)}件のASINを特定。価格を一括取得します...")
-        price_map = searcher.get_prices_batch(target_asins)
+        st.success(f"{len(target_asins)}件のASINを特定。詳細情報を取得します...")
+        # バッチ取得は廃止し、個別取得のみ実行
         
         results = []
         df_placeholder = st.empty()
         
         for i, asin in enumerate(target_asins):
-            status_text.text(f"詳細取得中: {asin} ({i+1}/{len(target_asins)})")
+            status_text.text(f"詳細取得中 (確実モード): {asin} ({i+1}/{len(target_asins)})")
             
-            pre_price = price_map.get(asin)
-            detail = searcher.get_product_details(asin, pre_fetched_price_data=pre_price)
+            # 個別取得を実行
+            detail = searcher.get_product_details(asin)
             
             if detail: results.append(detail)
             
@@ -427,9 +377,8 @@ def main():
                 df_placeholder.dataframe(df[cols].rename(columns=disp), use_container_width=True)
 
             progress_bar.progress(min(0.3 + ((i+1)/len(target_asins)*0.7), 1.0))
-            # スリープ時間を調整（バッチ価格があれば早め、なければ遅め）
-            sleep_time = 0.5 if pre_price else 1.5
-            time.sleep(sleep_time)
+            # ループ最後に強制待機を入れてAPI制限を回避（重要）
+            time.sleep(2.0)
 
         status_text.success("完了！")
         progress_bar.progress(100)
