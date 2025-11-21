@@ -113,7 +113,7 @@ class AmazonSearcher:
                 if 'salesRanks' in data and data['salesRanks']:
                     ranks = data['salesRanks'][0].get('ranks', [])
                     if ranks:
-                        r = ranks[-1]
+                        r = ranks[0]   # ← 「最初（大分類）」に変更
                         info['category'] = r.get('title', '')
                         info['rank'] = r.get('rank', 999999)
                         info['rank_disp'] = f"{info['rank']}位"
