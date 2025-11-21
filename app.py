@@ -73,7 +73,7 @@ class AmazonSearcher:
     def _call_api_safely(self, func, **kwargs):
         """API制限(429)を確実に回避する鉄壁のリトライ処理"""
         retries = 5
-        base_delay = 2.0 # 基本待機時間
+        base_delay = 2.0 
         
         for i in range(retries):
             try:
@@ -87,13 +87,28 @@ class AmazonSearcher:
                 return None
         return None
 
+    def get_seller_name(self, offer):
+        """【新機能】セラーIDを可能な限り店舗名に変換する"""
+        seller_id = offer.get('SellerId', 'Unknown')
+        
+        # 1. Amazon公式のID判定
+        if seller_id == 'AN1VRQENFRJN5':
+            return 'Amazon.co.jp'
+        
+        # 2. APIレスポンス内に名前があるか確認 (Sellerオブジェクト)
+        seller_obj = offer.get('Seller', {})
+        if 'Name' in seller_obj:
+            return seller_obj['Name']
+            
+        # 3. なければIDをそのまま返す
+        return seller_id
+
     def get_product_details_accurate(self, asin):
         """【精度最優先】時間をかけて正確な価格とポイントを取得する"""
         
         # 1. 基本情報 (Catalog API)
         catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
         
-        # カタログ取得は比較的制限が緩い
         res_cat = self._call_api_safely(
             catalog.get_catalog_item,
             asin=asin,
@@ -146,33 +161,29 @@ class AmazonSearcher:
                     info['rank'] = r.get('rank', 999999)
                     info['rank_disp'] = f"{info['rank']}位"
 
-        # 2. 価格とポイント (Products API - get_item_offers)
-        # ここで「正確な販売価格(ListingPrice)」と「ポイント」を取りに行く
+        # 2. 価格とポイント (Products API)
         products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
-        
-        # API制限対策のため、必ずリクエスト前に少し待つ
         time.sleep(1.5) 
         
         res_offers = self._call_api_safely(
             products_api.get_item_offers,
             asin=asin,
             MarketplaceId=self.mp_id,
-            item_condition='New' # 修正: 小文字スネークケースが正解
+            item_condition='New'
         )
 
         price_found = False
         
         if res_offers and res_offers.payload and 'Offers' in res_offers.payload:
-            # カート獲得者を最優先で探す
             target_offer = None
             
-            # まずカート獲得者を検索
+            # カート獲得者優先
             for offer in res_offers.payload['Offers']:
                 if offer.get('IsBuyBoxWinner', False):
                     target_offer = offer
                     break
             
-            # カートがいなければ、送料込み最安値を探す
+            # カートなしなら最安値
             if not target_offer:
                 best_p = float('inf')
                 for offer in res_offers.payload['Offers']:
@@ -183,33 +194,32 @@ class AmazonSearcher:
                         best_p = total
                         target_offer = offer
             
-            # 採用したオファーから情報を抽出
             if target_offer:
-                # ListingPrice = 商品本体価格（これが正しい販売価格）
                 p = (target_offer.get('ListingPrice') or {}).get('Amount', 0)
                 s = (target_offer.get('Shipping') or {}).get('Amount', 0)
-                total_price = p + s # 送料込み価格
+                total_price = p + s 
                 
-                # ポイント取得
                 pt_data = target_offer.get('Points', {})
                 points = pt_data.get('PointsNumber', 0)
                 
                 if total_price > 0:
                     info['price'] = total_price
                     info['price_disp'] = f"¥{total_price:,.0f}"
-                    info['seller'] = target_offer.get('SellerId', 'Seller')
+                    
+                    # ★ここでセラーIDを名前に変換
+                    info['seller'] = self.get_seller_name(target_offer)
                     
                     if points > 0:
                         info['points'] = f"{(points/total_price)*100:.1f}%"
                     
                     price_found = True
 
-        # 3. どうしても取れなかった場合の参考価格
+        # 3. 参考価格フォールバック
         if not price_found and list_price > 0:
             info['price_disp'] = f"¥{list_price:,.0f} (参考)"
             info['seller'] = 'Ref Only'
 
-        # 4. 手数料 (API制限回避のため少し待つ)
+        # 4. 手数料
         if info['price'] > 0:
             time.sleep(0.5) 
             fees_api = ProductFees(credentials=self.credentials, marketplace=self.marketplace)
@@ -281,7 +291,7 @@ class AmazonSearcher:
 def main():
     if not check_password(): return
 
-    st.title("📦 Amazon SP-API 商品リサーチツール（made by 岡田屋）")
+    st.title("📦 Amazon SP-API 商品リサーチツール")
 
     with st.sidebar:
         st.header("⚙️ 設定")
@@ -350,16 +360,14 @@ def main():
             st.error("商品が見つかりません")
             return
 
-        st.success(f"{len(target_asins)}件のASINを特定。高精度モードで取得します (少し時間がかかります)...")
+        st.success(f"{len(target_asins)}件のASINを特定。高精度モードで取得します...")
         
         results = []
         df_placeholder = st.empty()
         
-        # ここから1つずつ確実に処理
         for i, asin in enumerate(target_asins):
-            status_text.text(f"詳細取得中 ({i+1}/{len(target_asins)}): {asin} - 待機中...")
+            status_text.text(f"詳細取得中 ({i+1}/{len(target_asins)}): {asin}")
             
-            # 確実モードの関数を呼ぶ
             detail = searcher.get_product_details_accurate(asin)
             
             if detail: results.append(detail)
@@ -369,7 +377,7 @@ def main():
                 disp = {
                     'title':'商品名', 'brand':'ブランド', 'price_disp':'価格', 
                     'rank_disp':'ランキング', 'category':'カテゴリ',
-                    'points':'ポイント率', 'fee_rate':'手数料率', 'asin':'ASIN'
+                    'points':'ポイント率', 'fee_rate':'手数料率', 'seller': 'セラー', 'asin':'ASIN'
                 }
                 cols = [c for c in disp.keys() if c in df.columns]
                 df_placeholder.dataframe(df[cols].rename(columns=disp), use_container_width=True)
