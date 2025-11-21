@@ -363,6 +363,10 @@ def main():
         if results:
             df_final = pd.DataFrame(results)
             
+            # ★追加: 不要な列（rank, price）をCSVから削除する
+            # ※ rank_disp（ランキング表示用）や price_disp（価格表示用）は残ります
+            df_final = df_final.drop(columns=['rank', 'price'], errors='ignore')
+
             # 日本時間の日付ファイル名
             jst = pytz.timezone('Asia/Tokyo')
             filename = f"amazon_research_{datetime.now(jst).strftime('%Y%m%d_%H%M%S')}.csv"
