@@ -67,10 +67,9 @@ class AmazonSearcher:
         self.mp_id = 'A1VC38T7YXB528'
 
     def get_product_details(self, asin):
-        """ASINから詳細情報を取得（修正版：エラー回避＆価格取得強化）"""
+        """ASINから詳細情報を取得（セール価格対応：マルチソース比較版）"""
         try:
             # 1. Catalog API (基本情報)
-            # ★修正: 'offers' を削除しました（これがエラーの原因でした）
             catalog = CatalogItems(credentials=self.credentials, marketplace=self.marketplace)
             res = catalog.get_catalog_item(
                 asin=asin,
@@ -120,82 +119,93 @@ class AmazonSearcher:
                         info['rank'] = r.get('rank', 999999)
                         info['rank_disp'] = f"{info['rank']}位"
 
-            # 2. 価格取得フェーズ (Plan A -> Plan B)
+            # 2. 価格取得フェーズ (マルチソース比較)
+            # 複数のAPIから価格候補を集め、最も条件の良い（安い）価格を採用する
             products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
-            
-            # --- Plan A: get_item_offers (詳細な出品者情報から取得) ---
+            candidate_prices = [] # (price, seller_id, points, source_priority)
+
+            # --- Source A: get_pricing (カート価格・最安値情報) ---
+            # 動作が軽く、Amazon公式の「カート価格」を返しやすいため優先度高
+            try:
+                price_res = products_api.get_pricing(MarketplaceId=self.mp_id, Asins=[asin], ItemType='Asin')
+                if price_res and price_res.payload:
+                    product_data = price_res.payload[0].get('Product', {})
+                    
+                    # A-1: Competitive Price (カート価格)
+                    comp_prices = product_data.get('CompetitivePricing', {}).get('CompetitivePrices', [])
+                    for cp in comp_prices:
+                        price_obj = cp.get('Price', {})
+                        amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
+                        if amount > 0:
+                            # CompetitivePriceは信頼度が高いのでリストに追加
+                            candidate_prices.append({
+                                'price': amount,
+                                'seller': 'Amazon/Winner',
+                                'points': 0, # ここではポイント取れないことが多い
+                                'priority': 1 # 高優先
+                            })
+
+                    # A-2: Lowest Offer (最安値情報)
+                    lowest_offers = product_data.get('LowestOfferListings', [])
+                    for lo in lowest_offers:
+                        if lo.get('Qualifiers', {}).get('ItemCondition') == 'New': # 新品のみ
+                            price_obj = lo.get('Price', {})
+                            amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
+                            if amount > 0:
+                                candidate_prices.append({
+                                    'price': amount,
+                                    'seller': 'Lowest Offer',
+                                    'points': 0,
+                                    'priority': 2
+                                })
+            except Exception:
+                pass
+
+            # --- Source B: get_item_offers (詳細オファー情報) ---
+            # セール時など、Source Aが通常価格を返しても、こちらは実際の販売価格を返すことがある
             try:
                 offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, item_condition='New')
-                
                 if offers and offers.payload and 'Offers' in offers.payload:
-                    found_buybox = False
-                    lowest_price = float('inf')
-                    best_offer = None
-
                     for offer in offers.payload['Offers']:
                         listing_price = offer.get('ListingPrice', {}).get('Amount', 0)
                         shipping = offer.get('Shipping', {}).get('Amount', 0)
                         total_price = listing_price + shipping
                         
                         if total_price == 0: continue
-
-                        # カート獲得者を優先
-                        if offer.get('IsBuyBoxWinner', False):
-                            best_offer = offer
-                            info['price'] = total_price
-                            found_buybox = True
-                            break 
                         
-                        # 最安値を記録
-                        if total_price < lowest_price:
-                            lowest_price = total_price
-                            if not found_buybox:
-                                best_offer = offer
-                                info['price'] = total_price
+                        points = offer.get('Points', {}).get('PointsNumber', 0)
+                        seller = offer.get('SellerId', '')
+                        is_buybox = offer.get('IsBuyBoxWinner', False)
 
-                    if best_offer:
-                        p = info['price']
-                        info['price_disp'] = f"¥{p:,.0f}"
-                        info['seller'] = best_offer.get('SellerId', '')
-                        points = best_offer.get('Points', {}).get('PointsNumber', 0)
-                        if points > 0 and p > 0:
-                            info['points'] = f"{(points/p)*100:.1f}%"
+                        # カート獲得者なら超高優先
+                        prio = 0 if is_buybox else 3 
+                        
+                        candidate_prices.append({
+                            'price': total_price,
+                            'seller': seller,
+                            'points': points,
+                            'priority': prio
+                        })
             except Exception:
                 pass
 
-            # --- Plan B: get_pricing (Plan A失敗時の強力なバックアップ) ---
-            # カートボックス価格(Competitive Price)を取得しに行きます。
-            # セール価格などはここに反映されていることが多いです。
-            if info['price'] == 0:
-                try:
-                    price_res = products_api.get_pricing(MarketplaceId=self.mp_id, Asins=[asin], ItemType='Asin')
-                    if price_res and price_res.payload:
-                        product_data = price_res.payload[0].get('Product', {})
-                        
-                        # 優先順位1: Competitive Price (カート価格相当)
-                        comp_prices = product_data.get('CompetitivePricing', {}).get('CompetitivePrices', [])
-                        if comp_prices:
-                            price_obj = comp_prices[0].get('Price', {})
-                            # 送料込み(LandedPrice)があれば優先、なければ本体価格(ListingPrice)
-                            amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
-                            
-                            if amount > 0:
-                                info['price'] = amount
-                                info['price_disp'] = f"¥{amount:,.0f}"
-                                info['seller'] = 'Amazon/Others'
-                        
-                        # 優先順位2: 最安値情報 (Lowest Offer)
-                        if info['price'] == 0:
-                             lowest_offers = product_data.get('LowestOfferListings', [])
-                             if lowest_offers:
-                                 price_obj = lowest_offers[0].get('Price', {})
-                                 amount = price_obj.get('LandedPrice', {}).get('Amount') or price_obj.get('ListingPrice', {}).get('Amount', 0)
-                                 if amount > 0:
-                                    info['price'] = amount
-                                    info['price_disp'] = f"¥{amount:,.0f}"
-                                    info['seller'] = 'Lowest Offer'
-                except Exception:
-                    pass
+            # --- 価格決定ロジック ---
+            # 収集した候補の中から「最も安くて、優先度が高い」価格を選ぶ
+            # セール時は、通常価格(例:13800)とセール価格(例:10800)が混在するため、安い方を採用する
+            if candidate_prices:
+                # 価格が安い順、その中で優先度が高い順にソート
+                candidate_prices.sort(key=lambda x: (x['price'], x['priority']))
+                
+                best = candidate_prices[0]
+                info['price'] = best['price']
+                info['price_disp'] = f"¥{best['price']:,.0f}"
+                info['seller'] = best['seller']
+                
+                # ポイント計算 (Source A経由だとポイント0の場合があるので再計算)
+                # Source Bからポイント情報が取れていればそれを使う、なければ計算
+                p_val = best['points']
+                if p_val > 0:
+                    info['points'] = f"{(p_val/best['price'])*100:.1f}%"
 
             # 3. 手数料 (Fees API)
             if info['price'] > 0:
@@ -218,8 +228,6 @@ class AmazonSearcher:
             return info
 
         except Exception as e:
-            # 致命的なエラーでも止まらないようにNoneを返す
-            # st.error(f"商品詳細取得エラー ({asin}): {e}") # エラー表示を抑制する場合
             print(f"Error fetching {asin}: {e}")
             return None
 
@@ -293,7 +301,7 @@ def main():
     if not check_password():
         return
 
-    st.title("📦 Amazon SP-API 商品リサーチツール（made by 岡田屋）")
+    st.title("📦 Amazon SP-API 商品リサーチツール")
 
     # サイドバー
     with st.sidebar:
