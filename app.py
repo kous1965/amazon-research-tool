@@ -72,7 +72,7 @@ class AmazonSearcher:
         self.logs.append(f"[{ts}] {message}")
 
     def get_prices_batch(self, asin_list):
-        """ASINリストを一括で価格取得（ポイント考慮版）"""
+        """ASINリストを一括で価格取得（カート価格最優先・ポイント復元版）"""
         products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
         price_map = {} 
 
@@ -89,11 +89,13 @@ class AmazonSearcher:
                         asin = item.get('ASIN')
                         product = item.get('Product', {})
                         
-                        best_price = float('inf')
-                        best_seller = 'Unknown'
-                        best_points = 0
+                        found_cart_price = False
+                        final_price = 0
+                        final_points = 0
+                        final_seller = 'Unknown'
                         
-                        # 1. Competitive Pricing (カート価格)
+                        # 1. Competitive Pricing (カート価格) - 最優先
+                        # ここで価格が見つかれば、LowestOfferは見ない（誤判定防止）
                         comp = product.get('CompetitivePricing', {}).get('CompetitivePrices', [])
                         for cp in comp:
                             price_dict = cp.get('Price', {})
@@ -102,49 +104,61 @@ class AmazonSearcher:
                             amount = landed or listing
                             
                             if amount and amount > 0:
-                                # ★ここが修正点: ポイントがあれば価格に足し戻す
-                                # APIのCompetitivePriceは「ポイント差し引き後の実質価格」を返すことがあるため
+                                # ポイント情報の取得と復元
                                 points_info = cp.get('Points', {})
                                 p_val = (points_info.get('PointsMonetaryValue') or {}).get('Amount')
                                 if p_val is None:
-                                    p_val = points_info.get('PointsNumber', 0)
+                                    p_val = points_info.get('PointsNumber', 0) # JPYでは1pt=1円
                                 
-                                real_price = float(amount) + float(p_val)
+                                # 実質価格(amount) + ポイント(p_val) = 販売価格
+                                restored_price = float(amount) + float(p_val)
                                 
-                                if real_price < best_price:
-                                    best_price = real_price
-                                    best_seller = 'Cart Price'
-                                    best_points = float(p_val)
+                                final_price = restored_price
+                                final_points = float(p_val)
+                                final_seller = 'Cart Price'
+                                found_cart_price = True
+                                break # カート価格が見つかれば即採用
 
-                        # 2. Lowest Offer (最安値)
-                        lowest = product.get('LowestOfferListings', [])
-                        for lo in lowest:
-                            if (lo.get('Qualifiers') or {}).get('ItemCondition') == 'New':
-                                price_dict = lo.get('Price', {})
-                                landed = (price_dict.get('LandedPrice') or {}).get('Amount')
-                                listing = (price_dict.get('ListingPrice') or {}).get('Amount')
-                                amount = landed or listing
-                                
-                                if amount and amount > 0:
-                                    # LowestOfferは通常、そのままの価格で返ってくることが多いが念のため
-                                    points_info = lo.get('Points', {})
-                                    p_val = (points_info.get('PointsMonetaryValue') or {}).get('Amount')
-                                    if p_val is None:
-                                        p_val = points_info.get('PointsNumber', 0)
+                        # 2. Lowest Offer (最安値) - バックアップ
+                        # カート価格が取れなかった場合のみ実行
+                        if not found_cart_price:
+                            lowest = product.get('LowestOfferListings', [])
+                            best_lowest = float('inf')
+                            
+                            for lo in lowest:
+                                if (lo.get('Qualifiers') or {}).get('ItemCondition') == 'New':
+                                    price_dict = lo.get('Price', {})
+                                    landed = (price_dict.get('LandedPrice') or {}).get('Amount')
+                                    listing = (price_dict.get('ListingPrice') or {}).get('Amount')
+                                    amount = landed or listing
+                                    
+                                    if amount and amount > 0:
+                                        # ここでもポイント復元を試みる
+                                        points_info = lo.get('Points', {})
+                                        p_val = (points_info.get('PointsMonetaryValue') or {}).get('Amount')
+                                        if p_val is None:
+                                            p_val = points_info.get('PointsNumber', 0)
                                         
-                                    # 最安値APIの場合は、もしポイント考慮済みなら足すべきだが、
-                                    # 通常はListingPriceそのものが返るため、ここでは単純比較する
-                                    if float(amount) < best_price:
-                                        best_price = float(amount)
-                                        best_seller = 'Lowest Offer'
-                                        best_points = float(p_val)
+                                        restored_price = float(amount) + float(p_val)
+                                        
+                                        if restored_price < best_lowest:
+                                            best_lowest = restored_price
+                                            final_price = restored_price
+                                            final_points = float(p_val)
+                                            final_seller = 'Lowest Offer'
 
-                        if best_price != float('inf'):
+                        # 結果の保存
+                        if final_price > 0:
                             price_map[asin] = {
-                                'price': best_price,
-                                'seller': best_seller,
-                                'points': best_points
+                                'price': final_price,
+                                'seller': final_seller,
+                                'points': final_points
                             }
+                            self.log(f"Price set for {asin}: {final_price} (pts:{final_points}) via {final_seller}")
+                        else:
+                            self.log(f"No valid price found for {asin}")
+                else:
+                    self.log(f"Batch payload empty")
                 
                 time.sleep(1.0)
             except Exception as e:
@@ -220,7 +234,7 @@ class AmazonSearcher:
                 info['price_disp'] = f"¥{info['price']:,.0f}"
                 info['seller'] = pre_fetched_price_data['seller']
                 
-                # ポイント率計算（足し戻した価格を基準にする）
+                # ポイント率計算
                 pt = pre_fetched_price_data.get('points', 0)
                 if pt > 0:
                     info['points'] = f"{(pt/info['price'])*100:.1f}%"
@@ -231,23 +245,22 @@ class AmazonSearcher:
                 try:
                     offers = products_api.get_item_offers(asin=asin, MarketplaceId=self.mp_id, item_condition='New')
                     if offers and offers.payload and 'Offers' in offers.payload:
-                        best_p = float('inf')
-                        best_s = ''
-                        best_pt = 0
                         for offer in offers.payload['Offers']:
-                            p = (offer.get('ListingPrice') or {}).get('Amount', 0)
-                            s = (offer.get('Shipping') or {}).get('Amount', 0)
-                            total = p + s
-                            if total > 0 and total < best_p:
-                                best_p = total
-                                best_s = offer.get('SellerId', '')
-                                best_pt = (offer.get('Points') or {}).get('PointsNumber', 0)
-                        
-                        if best_p != float('inf'):
-                            info['price'] = best_p
-                            info['price_disp'] = f"¥{best_p:,.0f}"
-                            info['seller'] = best_s
-                            if best_pt > 0: info['points'] = f"{(best_pt/best_p)*100:.1f}%"
+                            if offer.get('IsBuyBoxWinner', False): # 個別取得時はカート獲得者を信じる
+                                p = (offer.get('ListingPrice') or {}).get('Amount', 0)
+                                s = (offer.get('Shipping') or {}).get('Amount', 0)
+                                total = p + s
+                                
+                                # 個別APIでは通常正しい販売価格が返るが、念のため確認
+                                pt_val = (offer.get('Points') or {}).get('PointsNumber', 0)
+                                
+                                if total > 0:
+                                    info['price'] = total
+                                    info['price_disp'] = f"¥{total:,.0f}"
+                                    info['seller'] = offer.get('SellerId', '')
+                                    if pt_val > 0:
+                                        info['points'] = f"{(pt_val/total)*100:.1f}%"
+                                break
                 except Exception as e:
                     pass
 
