@@ -26,8 +26,8 @@ def check_password():
         user_id = st.text_input("ユーザーID", key="login_user")
         password = st.text_input("パスワード", type="password", key="login_pass")
         if st.button("ログイン"):
-            ADMIN_USER = "admin"
-            ADMIN_PASS = "password123"
+            ADMIN_USER = "info@okadya.com"
+            ADMIN_PASS = "Akio6583okada"
             if user_id == ADMIN_USER and password == ADMIN_PASS:
                 st.session_state.password_correct = True
                 st.rerun()
