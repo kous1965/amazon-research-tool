@@ -180,7 +180,7 @@ class AmazonSearcher:
                 if ranks:
                     info['category'] = ranks[0].get('title', '')
                     info['rank'] = ranks[0].get('rank', 999999)
-                    info['rank_disp'] = f"{info['rank']}位"
+                    info['rank_disp'] = info['rank']
 
         # 2. Products API
         products_api = Products(credentials=self.credentials, marketplace=self.marketplace)
